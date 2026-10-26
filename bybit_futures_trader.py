@@ -26,11 +26,14 @@ Live (только после демо-периода):
 import json
 import os
 import sys
+import threading
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
 import bybit_futures_signal_bot as sb
+import tg_ui
 
 MODE = os.getenv("MODE", "demo").lower()          # demo | testnet | live
 CAPITAL_CAP = float(os.getenv("CAPITAL", "15"))   # торгуем не больше этой суммы
@@ -40,14 +43,23 @@ MAX_DRAWDOWN = 0.10        # −10% от пика: полная остановк
 MAX_SLIPPAGE_DIST = 0.30   # не входим, если цена ушла от сигнала более чем на 0.3 стопа
 STATE_FILE = Path("trader_state.json")
 STOP_FILE = Path("STOP")
+LOCK = threading.RLock()   # общий замок: цикл бота и кнопки Telegram не мешают друг другу
+REASONS = {}               # последняя причина «нет входа» по каждой паре (для кнопки «Пары»)
+META = {}                  # служебное: время последней проверки
 
 
 # ---------------- БИРЖА ----------------
 def make_exchange():
     import ccxt
+    # ccxt по умолчанию проверяет тип аккаунта запросом, для которого нужны права на вывод/перевод.
+    # Мы эти права намеренно НЕ даём ключу, поэтому тип аккаунта задаём вручную.
+    # Единый торговый аккаунт (UTA): так у всех новых аккаунтов и у демо. Классический: UNIFIED_ACCOUNT=0.
+    unified = os.getenv("UNIFIED_ACCOUNT", "1") != "0"
     ex = ccxt.bybit({
         "apiKey": os.getenv("BYBIT_KEY"), "secret": os.getenv("BYBIT_SECRET"),
-        "enableRateLimit": True, "options": {"defaultType": "swap"},
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap", "enableUnifiedMargin": False,
+                    "enableUnifiedAccount": unified},
     })
     if MODE == "testnet":
         ex.set_sandbox_mode(True)
@@ -119,7 +131,10 @@ def open_trade(ex, sig):
     tp = ex.price_to_precision(sym, sig["target"])
     params = {"stopLoss": {"triggerPrice": sl}, "takeProfit": {"triggerPrice": tp},
               "slTriggerBy": "MarkPrice", "tpTriggerBy": "LastPrice"}
-    ex.create_order(sym, "market", side, qty, None, params)
+    try:
+        ex.create_order(sym, "market", side, qty, None, params)
+    except Exception as e:
+        return None, f"биржа отклонила ордер (qty={qty}, SL={sl}, TP={tp}): {e}"
 
     ok, pos = verify_protection(ex, sym)
     if not ok:
@@ -134,16 +149,25 @@ def open_trade(ex, sig):
     if str(pos.get("marginMode", "")).lower() not in ("isolated", ""):
         warn = "⚠ маржа не изолированная: переключите в приложении Bybit"
     return {"qty": qty, "entry": entry, "stop": float(sl), "target": float(tp),
-            "dist": sig["dist"], "d": d, "opened_ms": int(time.time() * 1000)}, warn
+            "dist": sig["dist"], "d": d, "side": sig["side"],
+            "opened_ms": int(time.time() * 1000)}, warn
 
 
 # ---------------- СОСТОЯНИЕ И ЛИМИТЫ ----------------
 def load_state():
+    base = {"last": {}, "open": {}, "closed": [], "day": "", "day_start": 0.0,
+            "peak": 0.0, "halted": False, "notified_day": "", "paused": False}
     try:
-        return json.loads(STATE_FILE.read_text())
+        st = json.loads(STATE_FILE.read_text())
     except Exception:
-        return {"last": {}, "open": {}, "closed": [], "day": "", "day_start": 0.0,
-                "peak": 0.0, "halted": False, "notified_day": ""}
+        return base
+    for k, v in base.items():
+        st.setdefault(k, v)
+    # старый формат (просто числа R) -> записи со временем
+    st["closed"] = [c if isinstance(c, dict) else
+                    {"ts": 0, "symbol": "?", "side": "?", "r": float(c), "pnl": 0.0}
+                    for c in st["closed"]]
+    return st
 
 
 def save_state(st):
@@ -176,10 +200,11 @@ def manage_open(ex, st, positions):
             eq = equity(ex)
             delta = eq - t["equity_open"]
             r_est = delta / (t["qty"] * t["dist"]) if t["qty"] * t["dist"] else 0.0
-            st["closed"].append(r_est)
-            sb.tg(f"{'✅' if delta > 0 else '❌'} {sym} закрыта биржей (SL/TP)\n"
+            st["closed"].append({"ts": int(time.time()), "symbol": sym, "side": t.get("side", "?"),
+                                 "r": r_est, "pnl": delta})
+            sb.tg(f"{'✅' if delta > 0 else '❌'} {sym} закрыта (SL/TP или вручную)\n"
                   f"Изменение баланса {delta:+.3f} USDT (≈{r_est:+.2f}R)\nБаланс {eq:.2f} USDT\n"
-                  + sb.stats_line(st["closed"]))
+                  + sb.stats_line([c["r"] for c in st["closed"]]))
             del st["open"][sym]
         elif time.time() * 1000 - t["opened_ms"] > sb.MAX_HOLD * 3_600_000:
             try:
@@ -190,70 +215,102 @@ def manage_open(ex, st, positions):
 
 
 # ---------------- ОСНОВНОЙ ЦИКЛ ----------------
+def run_cycle(ex, st, symbols):
+    eq = equity(ex)
+    sb.CAPITAL = min(CAPITAL_CAP, eq)   # размер позиции считается от реального баланса
+    positions = open_positions(ex)
+    manage_open(ex, st, positions)
+    META["last_cycle"] = time.time()
+
+    gate = risk_gate(st, eq)
+    if gate:
+        for s_ in symbols:
+            REASONS[s_] = f"новые сделки отключены: {gate}"
+        key = st["day"] + gate
+        if st.get("notified_day") != key:
+            sb.tg(f"⛔ Новые сделки отключены: {gate}")
+            st["notified_day"] = key
+        save_state(st)
+        return
+    if st.get("paused"):
+        for s_ in symbols:
+            REASONS[s_] = "пауза (кнопка в боте)"
+        save_state(st)
+        return
+
+    try:
+        btc = sb.trend_dir(sb.fetch_df(ex, sb.BTC_SYMBOL, sb.HTF))
+    except Exception:
+        btc = None
+
+    for sym in symbols:
+        if sym in positions or sym in st["open"]:
+            REASONS[sym] = "позиция уже открыта"
+            continue
+        if len(positions) >= MAX_OPEN_POSITIONS:
+            REASONS[sym] = f"лимит открытых позиций ({MAX_OPEN_POSITIONS})"
+            continue
+        try:
+            df = sb.fetch_df(ex, sym, sb.TF)
+            if int(df["ts"].iloc[-1]) - st["last"].get(sym, 0) < sb.COOLDOWN_BARS * 3_600_000:
+                REASONS[sym] = f"пауза {sb.COOLDOWN_BARS} ч после последнего сигнала"
+                continue
+            try:
+                funding = ex.fetch_funding_rate(sym).get("fundingRate")
+            except Exception:
+                funding = None
+            htf = sb.fetch_df(ex, sym, sb.HTF)
+            sig, reason = sb.evaluate(sym, df, htf, btc, funding, sb.market_info(ex, sym))
+            if not sig:
+                REASONS[sym] = reason
+                print(f"[{sym}] нет сигнала: {reason}")
+                continue
+            REASONS[sym] = "сигнал найден"
+            st["last"][sym] = sig["bar_ts"]
+            sb.tg(sb.signal_text(sig))
+            trade, msg = open_trade(ex, sig)
+            if trade is None:
+                sb.tg(f"⚠ {sym}: сделка не открыта. {msg}")
+            else:
+                trade["equity_open"] = eq
+                st["open"][sym] = trade
+                positions[sym] = {"contracts": trade["qty"]}
+                sb.tg(f"📌 {sym} {sig['side']} открыта: вход {trade['entry']:.6g}, "
+                      f"SL {trade['stop']:.6g}, TP {trade['target']:.6g} (стоп и тейк на бирже) {msg}")
+            save_state(st)
+        except Exception as e:
+            print(f"[{sym}] ошибка: {e}")
+            sb.tg(f"⚠ {sym}: ошибка в боте: {str(e)[:500]}")
+    save_state(st)
+
+
 def main():
     ex = make_exchange()
     ex.load_markets()
-    symbols = [s for s in sb.SYMBOLS if s in ex.markets]
+    symbols = [s_ for s_ in sb.SYMBOLS if s_ in ex.markets]
     st = load_state()
-    banner = (f"Автобот запущен. Режим: {MODE.upper()}, капитал ≤{CAPITAL_CAP} USDT, "
-              f"риск {sb.RISK_PCT:.0%}, плечо ≤{sb.MAX_LEVERAGE}x, пары: {', '.join(symbols)}")
-    sb.tg(banner)
+    sb.tg(f"Автобот запущен. Режим: {MODE.upper()}, капитал ≤{CAPITAL_CAP} USDT, "
+          f"риск {sb.RISK_PCT:.0%}, плечо ≤{sb.MAX_LEVERAGE}x, пары: {', '.join(symbols)}")
+
+    if sb.TG_TOKEN and sb.TG_CHAT_ID:   # кнопки в Telegram
+        ctx = types.SimpleNamespace(
+            ex=ex, st=st, lock=LOCK, reasons=REASONS, meta=META,
+            equity=lambda: equity(ex), positions=lambda: open_positions(ex),
+            close_market=lambda s_, q, d: close_market(ex, s_, q, d),
+            save=lambda: save_state(st),
+            info={"mode": MODE.upper(), "symbols": symbols, "capital_cap": CAPITAL_CAP,
+                  "risk": sb.RISK_PCT, "lev": sb.MAX_LEVERAGE, "max_pos": MAX_OPEN_POSITIONS,
+                  "scan": sb.SCAN_EVERY_SEC, "daily": DAILY_LOSS_LIMIT, "dd": MAX_DRAWDOWN})
+        threading.Thread(target=tg_ui.TgUI(ctx, sb.TG_TOKEN, sb.TG_CHAT_ID).run, daemon=True).start()
+
     if MODE == "live":
         print("LIVE-режим: старт через 10 секунд, Ctrl+C для отмены")
         time.sleep(10)
 
     while True:
         try:
-            eq = equity(ex)
-            sb.CAPITAL = min(CAPITAL_CAP, eq)   # размер позиции считается от реального баланса
-            positions = open_positions(ex)
-            manage_open(ex, st, positions)
-            gate = risk_gate(st, eq)
-            if gate:
-                today = st["day"]
-                if st.get("notified_day") != today + gate:
-                    sb.tg(f"⛔ Новые сделки отключены: {gate}")
-                    st["notified_day"] = today + gate
-                save_state(st)
-                time.sleep(sb.SCAN_EVERY_SEC)
-                continue
-
-            try:
-                btc = sb.trend_dir(sb.fetch_df(ex, sb.BTC_SYMBOL, sb.HTF))
-            except Exception:
-                btc = None
-
-            for sym in symbols:
-                if sym in positions or sym in st["open"] or len(positions) >= MAX_OPEN_POSITIONS:
-                    continue
-                try:
-                    df = sb.fetch_df(ex, sym, sb.TF)
-                    if int(df["ts"].iloc[-1]) - st["last"].get(sym, 0) < sb.COOLDOWN_BARS * 3_600_000:
-                        continue
-                    try:
-                        funding = ex.fetch_funding_rate(sym).get("fundingRate")
-                    except Exception:
-                        funding = None
-                    htf = sb.fetch_df(ex, sym, sb.HTF)
-                    sig, reason = sb.evaluate(sym, df, htf, btc, funding, sb.market_info(ex, sym))
-                    if not sig:
-                        print(f"[{sym}] нет сигнала: {reason}")
-                        continue
-                    st["last"][sym] = sig["bar_ts"]
-                    sb.tg(sb.signal_text(sig))
-                    trade, msg = open_trade(ex, sig)
-                    if trade is None:
-                        sb.tg(f"⚠ {sym}: сделка не открыта. {msg}")
-                    else:
-                        trade["equity_open"] = eq
-                        st["open"][sym] = trade
-                        positions[sym] = {"contracts": trade["qty"]}
-                        sb.tg(f"📌 {sym} {sig['side']} открыта: вход {trade['entry']:.6g}, "
-                              f"SL {trade['stop']:.6g}, TP {trade['target']:.6g} (стоп и тейк на бирже) {msg}")
-                    save_state(st)
-                except Exception as e:
-                    print(f"[{sym}] ошибка: {e}")
-            save_state(st)
+            with LOCK:
+                run_cycle(ex, st, symbols)
         except Exception as e:
             print("Цикл:", e)
         time.sleep(sb.SCAN_EVERY_SEC)
