@@ -27,10 +27,19 @@ try:
 except Exception as e:
     print("IP определить не удалось:", e)
 
-sb.tg(f"Запуск на Bothost. Режим: {mode}. Капитал {os.getenv('CAPITAL', '15')} USDT.")
+VERSION = "v3: кнопки Telegram, исправление прав ключа (UTA)"
+sb.tg(f"Запуск на Bothost. Версия: {VERSION}. Режим: {mode}. Капитал {os.getenv('CAPITAL', '15')} USDT.")
 
-if trading:
-    import bybit_futures_trader as app
-else:
-    app = sb
-app.main()
+import traceback
+
+try:
+    if trading:
+        import bybit_futures_trader as app
+    else:
+        app = sb
+    app.main()
+except Exception:
+    err = traceback.format_exc()
+    print(err)
+    sb.tg("🚨 Бот остановился с ошибкой:\n" + err[-1500:])
+    raise
