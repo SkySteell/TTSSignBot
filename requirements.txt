@@ -1,4 +1,3 @@
-# метка v3
 ccxt
 pandas
 numpy
