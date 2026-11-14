@@ -130,29 +130,29 @@ def verify_protection(ex, sym, tries=5):
 
 
 def ensure_margin_and_leverage(ex, sym, leverage):
-    """Не входить, если isolated и плечо не удалось подтвердить."""
-    errors = []
-    for operation in (
-        lambda: ex.set_margin_mode("isolated", sym, params={"leverage": leverage}),
-        lambda: ex.set_leverage(leverage, sym),
-    ):
-        try:
-            operation()
-        except Exception as exc:
-            # Bybit может отвечать "not modified" на уже действующую настройку.
-            errors.append(str(exc))
+    """UTA: isolated — режим всего аккаунта, а не отдельной торговой пары."""
+    account = ex.private_get_v5_account_info()
+    if str(account.get("retCode", 0)) != "0":
+        raise RuntimeError(f"Bybit account info: {account.get('retMsg')}")
+    margin_mode = str((account.get("result") or {}).get("marginMode") or "")
+    if margin_mode != "ISOLATED_MARGIN":
+        raise RuntimeError(
+            f"Bybit UTA marginMode={margin_mode or 'н/д'}; "
+            "настройте ISOLATED_MARGIN вручную на демосчёте"
+        )
+    try:
+        ex.set_leverage(leverage, sym)
+    except Exception as exc:
+        # Возможно, плечо уже установлено: обязательно перечитать состояние.
+        print(f"[{sym}] set_leverage: {exc}")
     ps = ex.fetch_positions([sym])
     for p in ps:
         if p.get("symbol") != sym:
             continue
-        mode = str(p.get("marginMode") or "").lower()
         lev = float(p.get("leverage") or (p.get("info") or {}).get("leverage") or 0)
-        if mode == "isolated" and abs(lev - leverage) < 0.01:
+        if abs(lev - leverage) < 0.01:
             return
-    raise RuntimeError(
-        f"Isolated margin / плечо {leverage}x не подтверждены Bybit. "
-        + ("; ".join(errors)[:250] if errors else "Проверьте настройки демосчёта")
-    )
+    raise RuntimeError(f"Плечо {leverage}x не подтверждено Bybit для {sym}")
 
 
 def emergency_flatten(ex, sym, d):
@@ -196,6 +196,7 @@ def open_trade(ex, sig):
         return None, f"риск с учётом издержек {est_risk:.3f} USDT выше лимита"
     params = {"stopLoss": {"triggerPrice": sl}, "takeProfit": {"triggerPrice": tp},
               "slTriggerBy": "MarkPrice", "tpTriggerBy": "LastPrice"}
+    sent_ms = int(time.time() * 1000)
     try:
         order = ex.create_order(sym, "market", side, qty, None, params)
     except Exception as exc:
@@ -219,7 +220,11 @@ def open_trade(ex, sig):
             emergency_flatten(ex, sym, d)
         except Exception as exc:
             raise UnsafeTradeError(f"{sym}: SL/TP отсутствуют, закрытие НЕ подтверждено: {exc}") from exc
-        raise UnsafeTradeError(f"{sym}: SL/TP не подтверждены; позиция аварийно закрыта")
+        if pos is None:
+            raise UnsafeTradeError(
+                f"{sym}: позиция после ордера не найдена; отсутствие позднего исполнения НЕ доказано"
+            )
+        raise UnsafeTradeError(f"{sym}: SL/TP не подтверждены; закрытие позиции проверено, ручная сверка обязательна")
     entry = float(pos.get("entryPrice") or last)
     if str(pos.get("side") or "").lower() != ("long" if d == 1 else "short"):
         raise UnsafeTradeError(f"{sym}: сторона позиции не совпала; проверьте Bybit вручную")
@@ -228,7 +233,7 @@ def open_trade(ex, sig):
         "stop": float(sl), "target": float(tp), "dist": sig["dist"],
         "risk_usdt": est_risk, "d": d, "side": sig["side"],
         "order_id": str(order.get("id") or ""),
-        "opened_ms": int(time.time() * 1000),
+        "opened_ms": sent_ms,
     }, ""
 
 
@@ -296,10 +301,10 @@ def risk_gate(st, eq):
         return "аварийная остановка (сначала проверить биржу и состояние)"
     peak_base = min(CAPITAL_CAP, float(st["peak"]))
     daily_base = min(CAPITAL_CAP, float(st["day_start"]))
-    if peak_base > 0 and float(st["peak"]) - eq > peak_base * MAX_DRAWDOWN:
+    if peak_base > 0 and float(st["peak"]) - eq >= peak_base * MAX_DRAWDOWN:
         st["halted"] = True
         return f"просадка торгового капитала более {MAX_DRAWDOWN:.0%}: ручная остановка"
-    if daily_base > 0 and float(st["day_start"]) - eq > daily_base * DAILY_LOSS_LIMIT:
+    if daily_base > 0 and float(st["day_start"]) - eq >= daily_base * DAILY_LOSS_LIMIT:
         return f"дневной лимит убытка {DAILY_LOSS_LIMIT:.0%}: пауза до завтра"
     return None
 
@@ -471,6 +476,7 @@ def run_cycle(ex, st, symbols):
                 continue
             REASONS[sym] = "сигнал найден"
             sb.tg(sb.signal_text(sig))
+            st["last"][sym] = sig["bar_ts"]  # не повторять один сигнал каждые 5 минут
             # Записываем намерение ДО внешнего запроса. Сбой не создаст второй ордер.
             st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
                              "started_ms": int(time.time() * 1000)}
