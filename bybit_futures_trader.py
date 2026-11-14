@@ -36,12 +36,12 @@ import bybit_futures_signal_bot as sb
 import tg_ui
 
 MODE = os.getenv("MODE", "demo").lower()          # demo | testnet | live
-CAPITAL_CAP = float(os.getenv("CAPITAL", "15"))   # торгуем не больше этой суммы
+CAPITAL_CAP = float(os.getenv("CAPITAL", "150"))   # торгуем не больше этой суммы
 MAX_OPEN_POSITIONS = 2
 DAILY_LOSS_LIMIT = 0.03    # −3% от баланса на начало дня: стоп на сутки
 MAX_DRAWDOWN = 0.10        # −10% от пика: полная остановка до ручного сброса
 MAX_SLIPPAGE_DIST = 0.30   # не входим, если цена ушла от сигнала более чем на 0.3 стопа
-STATE_FILE = Path("trader_state.json")
+STATE_FILE = Path(os.getenv("STATE_FILE", "trader_state.json"))
 STOP_FILE = Path("STOP")
 LOCK = threading.RLock()   # общий замок: цикл бота и кнопки Telegram не мешают друг другу
 REASONS = {}               # последняя причина «нет входа» по каждой паре (для кнопки «Пары»)
@@ -51,40 +51,54 @@ META = {}                  # служебное: время последней �
 # ---------------- БИРЖА ----------------
 def make_exchange():
     import ccxt
-    # ccxt по умолчанию проверяет тип аккаунта запросом, для которого нужны права на вывод/перевод.
-    # Мы эти права намеренно НЕ даём ключу, поэтому тип аккаунта задаём вручную.
-    # Единый торговый аккаунт (UTA): так у всех новых аккаунтов и у демо. Классический: UNIFIED_ACCOUNT=0.
+    # В тестовом выпуске торговля на реальных средствах выключена безусловно.
+    if MODE != "demo":
+        raise RuntimeError("TTSSignBot: разрешён только MODE=demo; live/testnet отключены")
+    if CAPITAL_CAP <= 0:
+        raise RuntimeError("CAPITAL должен быть положительным")
+    if not (os.getenv("BYBIT_KEY") and os.getenv("BYBIT_SECRET")):
+        raise RuntimeError("Для DEMO нужны отдельные API-ключи демосчёта Bybit")
     unified = os.getenv("UNIFIED_ACCOUNT", "1") != "0"
     ex = ccxt.bybit({
         "apiKey": os.getenv("BYBIT_KEY"), "secret": os.getenv("BYBIT_SECRET"),
         "enableRateLimit": True,
+        "timeout": 15000,
         "options": {"defaultType": "swap", "enableUnifiedMargin": False,
                     "enableUnifiedAccount": unified},
     })
-    if MODE == "testnet":
-        ex.set_sandbox_mode(True)
-    elif MODE == "demo":
-        ex.enable_demo_trading(True)
-    elif MODE == "live":
-        if os.getenv("LIVE_CONFIRM") != "YES-I-ACCEPT-RISK":
-            sys.exit("Для live задайте LIVE_CONFIRM=YES-I-ACCEPT-RISK")
-    else:
-        sys.exit("MODE: demo | testnet | live")
-    if not (os.getenv("BYBIT_KEY") and os.getenv("BYBIT_SECRET")):
-        sys.exit("Нужны BYBIT_KEY и BYBIT_SECRET")
+    ex.enable_demo_trading(True)
     return ex
 
 
 def equity(ex):
-    bal = ex.fetch_balance()
-    return float((bal.get("USDT") or {}).get("total") or 0)
+    """USDT equity, включая плавающий PnL, а не walletBalance/USDT.total."""
+    bal = ex.fetch_balance({"type": "swap"})
+    accounts = ((bal.get("info") or {}).get("result") or {}).get("list") or []
+    for account in accounts:
+        for coin in account.get("coin") or []:
+            if coin.get("coin") == "USDT":
+                value = coin.get("equity")
+                if value not in (None, ""):
+                    n = float(value)
+                    if not (0 < n < float("inf")):
+                        raise RuntimeError("Некорректный USDT equity")
+                    return n
+    raise RuntimeError("Bybit не вернул подтверждённый equity USDT: торговля заблокирована")
 
 
 def open_positions(ex):
+    """Только позиции one-way USDT linear; неоднозначные режимы запрещены."""
     out = {}
     for p in ex.fetch_positions():
-        if float(p.get("contracts") or 0) > 0:
-            out[p["symbol"]] = p
+        if float(p.get("contracts") or 0) <= 0:
+            continue
+        sym = p["symbol"]
+        if sym in out:
+            raise RuntimeError(f"{sym}: две позиции на одну пару (hedge не поддерживается)")
+        idx = (p.get("info") or {}).get("positionIdx")
+        if idx not in (None, "", 0, "0"):
+            raise RuntimeError(f"{sym}: hedge-mode, positionIdx={idx}; торговля отключена")
+        out[sym] = p
     return out
 
 
@@ -93,22 +107,72 @@ def close_market(ex, sym, qty, d):
     return ex.create_order(sym, "market", side, qty, None, {"reduceOnly": True})
 
 
-def verify_protection(ex, sym, tries=4):
-    """Проверяет, что у позиции есть и стоп, и тейк. Возвращает (ok, position)."""
-    pos = None
+class UnsafeTradeError(RuntimeError):
+    """Исход ордера или защита не подтверждены: требуется ручная проверка."""
+
+
+def verify_protection(ex, sym, tries=5):
+    """Проверить биржевые SL/TP, не полагаясь на ответ create_order."""
+    latest = None
     for _ in range(tries):
         time.sleep(1)
-        for p in ex.fetch_positions([sym]):
-            if float(p.get("contracts") or 0) > 0:
-                pos = p
-                info = p.get("info") or {}
-                if float(info.get("stopLoss") or 0) > 0 and float(info.get("takeProfit") or 0) > 0:
-                    return True, p
-    return False, pos
+        positions = ex.fetch_positions([sym])
+        for p in positions:
+            if p.get("symbol") != sym or float(p.get("contracts") or 0) <= 0:
+                continue
+            latest = p
+            info = p.get("info") or {}
+            sl = float(info.get("stopLoss") or 0)
+            tp = float(info.get("takeProfit") or 0)
+            if sl > 0 and tp > 0:
+                return True, p
+    return False, latest
+
+
+def ensure_margin_and_leverage(ex, sym, leverage):
+    """Не входить, если isolated и плечо не удалось подтвердить."""
+    errors = []
+    for operation in (
+        lambda: ex.set_margin_mode("isolated", sym, params={"leverage": leverage}),
+        lambda: ex.set_leverage(leverage, sym),
+    ):
+        try:
+            operation()
+        except Exception as exc:
+            # Bybit может отвечать "not modified" на уже действующую настройку.
+            errors.append(str(exc))
+    ps = ex.fetch_positions([sym])
+    for p in ps:
+        if p.get("symbol") != sym:
+            continue
+        mode = str(p.get("marginMode") or "").lower()
+        lev = float(p.get("leverage") or (p.get("info") or {}).get("leverage") or 0)
+        if mode == "isolated" and abs(lev - leverage) < 0.01:
+            return
+    raise RuntimeError(
+        f"Isolated margin / плечо {leverage}x не подтверждены Bybit. "
+        + ("; ".join(errors)[:250] if errors else "Проверьте настройки демосчёта")
+    )
+
+
+def emergency_flatten(ex, sym, d):
+    """Закрыть найденную позицию и дождаться фактического отсутствия на бирже."""
+    ps = open_positions(ex)
+    pos = ps.get(sym)
+    if pos is not None:
+        side = str(pos.get("side") or "").lower()
+        if side != ("long" if d == 1 else "short"):
+            raise UnsafeTradeError(f"{sym}: сторона позиции не совпадает, ручная проверка")
+        close_market(ex, sym, float(pos["contracts"]), d)
+    for _ in range(5):
+        time.sleep(1)
+        if sym not in open_positions(ex):
+            return True
+    raise UnsafeTradeError(f"{sym}: позиция всё ещё открыта после аварийного закрытия")
 
 
 def open_trade(ex, sig):
-    """Вход с SL/TP на бирже. Возвращает (dict | None, сообщение)."""
+    """Открыть сделку только в DEMO, подтвердить защиту на бирже."""
     sym, d = sig["symbol"], sig["d"]
     side = "buy" if d == 1 else "sell"
     last = float(ex.fetch_ticker(sym)["last"])
@@ -116,41 +180,56 @@ def open_trade(ex, sig):
         return None, f"цена ушла от сигнала ({last} vs {sig['price']:.6g}): пропуск"
     if (d == 1 and last <= sig["stop"]) or (d == -1 and last >= sig["stop"]):
         return None, "цена уже за стопом: пропуск"
-
-    try:  # изолированная маржа и плечо; «не изменено» не считается ошибкой
-        ex.set_margin_mode("isolated", sym, params={"leverage": sig["lev"]})
-    except Exception as e:
-        print(f"[{sym}] margin mode: {e}")
     try:
-        ex.set_leverage(sig["lev"], sym)
-    except Exception as e:
-        print(f"[{sym}] leverage: {e}")
+        ensure_margin_and_leverage(ex, sym, sig["lev"])
+    except Exception as exc:
+        return None, f"настройки маржи/плеча: {exc}"
 
     qty = float(ex.amount_to_precision(sym, sig["qty"]))
     sl = ex.price_to_precision(sym, sig["stop"])
     tp = ex.price_to_precision(sym, sig["target"])
+    if qty <= 0:
+        return None, "объём после округления равен нулю"
+    actual_dist = abs(last - float(sl))
+    est_risk = qty * (actual_dist + last * sb.RT_COST)
+    if est_risk > sb.CAPITAL * sb.RISK_PCT + 1e-8:
+        return None, f"риск с учётом издержек {est_risk:.3f} USDT выше лимита"
     params = {"stopLoss": {"triggerPrice": sl}, "takeProfit": {"triggerPrice": tp},
               "slTriggerBy": "MarkPrice", "tpTriggerBy": "LastPrice"}
     try:
-        ex.create_order(sym, "market", side, qty, None, params)
-    except Exception as e:
-        return None, f"биржа отклонила ордер (qty={qty}, SL={sl}, TP={tp}): {e}"
-
-    ok, pos = verify_protection(ex, sym)
+        order = ex.create_order(sym, "market", side, qty, None, params)
+    except Exception as exc:
+        # Timeout/5xx может означать, что ордер уже принят Bybit. Не повторять!
+        raise UnsafeTradeError(
+            f"{sym}: результат размещения неизвестен ({str(exc)[:250]}). "
+            "Новые входы заблокированы. Проверьте позиции и SL/TP вручную"
+        ) from exc
+    try:
+        ok, pos = verify_protection(ex, sym)
+    except Exception as exc:
+        try:
+            emergency_flatten(ex, sym, d)
+        except Exception as close_exc:
+            raise UnsafeTradeError(
+                f"{sym}: нет связи при проверке SL/TP; закрытие не подтверждено: {close_exc}"
+            ) from exc
+        raise UnsafeTradeError(f"{sym}: проверка защиты дала ошибку; позиция закрыта, требуется проверка") from exc
     if not ok:
         try:
-            if pos is not None:
-                close_market(ex, sym, float(pos["contracts"]), d)
-        except Exception as e:
-            return None, f"🚨 SL/TP не подтверждены и закрыть не удалось ({e}): ПРОВЕРЬТЕ ПОЗИЦИЮ ВРУЧНУЮ"
-        return None, "SL/TP не появились на бирже, позиция закрыта аварийно"
-    entry = float(pos.get("entryPrice") or sig["price"])
-    warn = ""
-    if str(pos.get("marginMode", "")).lower() not in ("isolated", ""):
-        warn = "⚠ маржа не изолированная: переключите в приложении Bybit"
-    return {"qty": qty, "entry": entry, "stop": float(sl), "target": float(tp),
-            "dist": sig["dist"], "d": d, "side": sig["side"],
-            "opened_ms": int(time.time() * 1000)}, warn
+            emergency_flatten(ex, sym, d)
+        except Exception as exc:
+            raise UnsafeTradeError(f"{sym}: SL/TP отсутствуют, закрытие НЕ подтверждено: {exc}") from exc
+        raise UnsafeTradeError(f"{sym}: SL/TP не подтверждены; позиция аварийно закрыта")
+    entry = float(pos.get("entryPrice") or last)
+    if str(pos.get("side") or "").lower() != ("long" if d == 1 else "short"):
+        raise UnsafeTradeError(f"{sym}: сторона позиции не совпала; проверьте Bybit вручную")
+    return {
+        "qty": float(pos.get("contracts") or qty), "entry": entry,
+        "stop": float(sl), "target": float(tp), "dist": sig["dist"],
+        "risk_usdt": est_risk, "d": d, "side": sig["side"],
+        "order_id": str(order.get("id") or ""),
+        "opened_ms": int(time.time() * 1000),
+    }, ""
 
 
 # ---------------- СОСТОЯНИЕ И ЛИМИТЫ ----------------
