@@ -393,15 +393,42 @@ def manage_open(ex, st, positions):
 # ---------------- ОСНОВНОЙ ЦИКЛ ----------------
 def run_cycle(ex, st, symbols):
     eq = equity(ex)
-    sb.CAPITAL = min(CAPITAL_CAP, eq)   # размер позиции считается от реального баланса
+    sb.CAPITAL = min(CAPITAL_CAP, eq)
     positions = open_positions(ex)
+
+    # Никакой торговли при неизвестных/ручных позициях на том же аккаунте.
+    unmanaged = [sym for sym in positions if sym not in st["open"]]
+    mismatched = [
+        sym for sym in positions if sym in st["open"]
+        and str(positions[sym].get("side") or "").lower()
+        != ("long" if st["open"][sym]["d"] == 1 else "short")
+    ]
+    if unmanaged or mismatched:
+        st["halted"], st["paused"] = True, True
+        reason = f"неучтённые позиции {unmanaged}, неверная сторона {mismatched}"
+        save_state(st)
+        if st.get("notified_day") != reason:
+            sb.tg(f"🚨 TTSSignBot: {reason}. Входы заблокированы, проверьте Bybit вручную")
+            st["notified_day"] = reason
+            save_state(st)
+        return
     manage_open(ex, st, positions)
     META["last_cycle"] = time.time()
 
+    # После исчезновения позиции ждём биржевую запись Closed PnL.
+    unconfirmed = [sym for sym in st["open"] if sym not in positions]
+    if unconfirmed:
+        for sym in symbols:
+            REASONS[sym] = f"ожидаем подтверждение закрытия {', '.join(unconfirmed)}"
+        save_state(st)
+        return
+
+    eq = equity(ex)
+    sb.CAPITAL = min(CAPITAL_CAP, eq)
     gate = risk_gate(st, eq)
     if gate:
-        for s_ in symbols:
-            REASONS[s_] = f"новые сделки отключены: {gate}"
+        for sym in symbols:
+            REASONS[sym] = f"новые сделки отключены: {gate}"
         key = st["day"] + gate
         if st.get("notified_day") != key:
             sb.tg(f"⛔ Новые сделки отключены: {gate}")
@@ -409,15 +436,17 @@ def run_cycle(ex, st, symbols):
         save_state(st)
         return
     if st.get("paused"):
-        for s_ in symbols:
-            REASONS[s_] = "пауза (кнопка в боте)"
+        for sym in symbols:
+            REASONS[sym] = "пауза (кнопка в боте)"
         save_state(st)
         return
 
     try:
         btc = sb.trend_dir(sb.fetch_df(ex, sb.BTC_SYMBOL, sb.HTF))
-    except Exception:
-        btc = None
+    except Exception as exc:
+        # Без BTC-фильтра сигналы по альтам не принимаем.
+        sb.tg(f"⚠ BTC 4h недоступен: {str(exc)[:200]}; новые входы пропущены")
+        return
 
     for sym in symbols:
         if sym in positions or sym in st["open"]:
@@ -429,7 +458,7 @@ def run_cycle(ex, st, symbols):
         try:
             df = sb.fetch_df(ex, sym, sb.TF)
             if int(df["ts"].iloc[-1]) - st["last"].get(sym, 0) < sb.COOLDOWN_BARS * 3_600_000:
-                REASONS[sym] = f"пауза {sb.COOLDOWN_BARS} ч после последнего сигнала"
+                REASONS[sym] = f"пауза {sb.COOLDOWN_BARS} ч после сигнала"
                 continue
             try:
                 funding = ex.fetch_funding_rate(sym).get("fundingRate")
@@ -439,36 +468,74 @@ def run_cycle(ex, st, symbols):
             sig, reason = sb.evaluate(sym, df, htf, btc, funding, sb.market_info(ex, sym))
             if not sig:
                 REASONS[sym] = reason
-                print(f"[{sym}] нет сигнала: {reason}")
                 continue
             REASONS[sym] = "сигнал найден"
-            st["last"][sym] = sig["bar_ts"]
             sb.tg(sb.signal_text(sig))
-            trade, msg = open_trade(ex, sig)
+            # Записываем намерение ДО внешнего запроса. Сбой не создаст второй ордер.
+            st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
+                             "started_ms": int(time.time() * 1000)}
+            save_state(st)
+            try:
+                trade, msg = open_trade(ex, sig)
+            except UnsafeTradeError as exc:
+                st["halted"], st["paused"] = True, True
+                save_state(st)  # pending остаётся до ручной сверки
+                sb.tg(f"🚨 КРИТИЧНО: {exc}. Торговля остановлена. "
+                      "Проверьте биржу, не перезапускайте без сверки.")
+                return
             if trade is None:
+                st["pending"] = None
+                REASONS[sym] = msg
                 sb.tg(f"⚠ {sym}: сделка не открыта. {msg}")
             else:
-                trade["equity_open"] = eq
+                st["last"][sym] = sig["bar_ts"]
                 st["open"][sym] = trade
-                positions[sym] = {"contracts": trade["qty"]}
+                positions[sym] = {"contracts": trade["qty"], "side": "long" if sig["d"] == 1 else "short"}
+                st["pending"] = None
                 sb.tg(f"📌 {sym} {sig['side']} открыта: вход {trade['entry']:.6g}, "
-                      f"SL {trade['stop']:.6g}, TP {trade['target']:.6g} (стоп и тейк на бирже) {msg}")
+                      f"SL {trade['stop']:.6g}, TP {trade['target']:.6g} (подтверждены на бирже)")
             save_state(st)
-        except Exception as e:
-            print(f"[{sym}] ошибка: {e}")
-            sb.tg(f"⚠ {sym}: ошибка в боте: {str(e)[:500]}")
+        except Exception as exc:
+            print(f"[{sym}] ошибка: {exc}")
+            if st.get("pending"):
+                st["halted"], st["paused"] = True, True
+                try:
+                    save_state(st)
+                finally:
+                    sb.tg(f"🚨 {sym}: авария после начала отправки ордера: {exc}. "
+                          "Проверьте демосчёт вручную!")
+                return
+            sb.tg(f"⚠ {sym}: ошибка в боте: {str(exc)[:300]}")
     save_state(st)
 
 
 def main():
     ex = make_exchange()
     ex.load_markets()
-    symbols = [s_ for s_ in sb.SYMBOLS if s_ in ex.markets]
+    symbols = [
+        sym for sym in sb.SYMBOLS
+        if sym in ex.markets and ex.market(sym).get("swap")
+        and ex.market(sym).get("linear") and ex.market(sym).get("active") is not False
+    ]
+    missing = [sym for sym in sb.SYMBOLS if sym not in symbols]
+    if missing:
+        sb.tg("⚠ Не торгуются на Bybit DEMO (без автоматической замены): "
+              + ", ".join(missing))
+    if sb.BTC_SYMBOL not in symbols:
+        raise RuntimeError("BTC/USDT perpetual недоступен: запуск заблокирован")
     st = load_state()
-    sb.tg(f"Автобот запущен. Режим: {MODE.upper()}, капитал ≤{CAPITAL_CAP} USDT, "
-          f"риск {sb.RISK_PCT:.0%}, плечо ≤{sb.MAX_LEVERAGE}x, пары: {', '.join(symbols)}")
+    save_state(st)
+    sb.tg(
+        f"Автобот DEMO v4 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
+        f"риск ≤{sb.RISK_PCT:.0%} включая оценку издержек, плечо ≤{sb.MAX_LEVERAGE}x, "
+        f"активных пар {len(symbols)}: {', '.join(symbols)}. "
+        f"Исторических (непроверенных) сделок: {len(st.get('legacy_closed', []))}"
+    )
 
-    if sb.TG_TOKEN and sb.TG_CHAT_ID:   # кнопки в Telegram
+    admin_id = os.getenv("TG_ADMIN_ID", "")
+    if not admin_id and sb.TG_CHAT_ID and str(sb.TG_CHAT_ID).isdigit():
+        admin_id = str(sb.TG_CHAT_ID)  # приватный чат с самим пользователем
+    if sb.TG_TOKEN and sb.TG_CHAT_ID and admin_id:
         ctx = types.SimpleNamespace(
             ex=ex, st=st, lock=LOCK, reasons=REASONS, meta=META,
             equity=lambda: equity(ex), positions=lambda: open_positions(ex),
@@ -476,19 +543,28 @@ def main():
             save=lambda: save_state(st),
             info={"mode": MODE.upper(), "symbols": symbols, "capital_cap": CAPITAL_CAP,
                   "risk": sb.RISK_PCT, "lev": sb.MAX_LEVERAGE, "max_pos": MAX_OPEN_POSITIONS,
-                  "scan": sb.SCAN_EVERY_SEC, "daily": DAILY_LOSS_LIMIT, "dd": MAX_DRAWDOWN})
-        threading.Thread(target=tg_ui.TgUI(ctx, sb.TG_TOKEN, sb.TG_CHAT_ID).run, daemon=True).start()
-
-    if MODE == "live":
-        print("LIVE-режим: старт через 10 секунд, Ctrl+C для отмены")
-        time.sleep(10)
+                  "scan": sb.SCAN_EVERY_SEC, "daily": DAILY_LOSS_LIMIT, "dd": MAX_DRAWDOWN},
+        )
+        threading.Thread(
+            target=tg_ui.TgUI(ctx, sb.TG_TOKEN, sb.TG_CHAT_ID, admin_id).run,
+            daemon=True,
+        ).start()
+    else:
+        sb.tg("⚠ Telegram-кнопки выключены: задайте TG_ADMIN_ID (ID владельца).")
 
     while True:
         try:
             with LOCK:
                 run_cycle(ex, st, symbols)
-        except Exception as e:
-            print("Цикл:", e)
+        except Exception as exc:
+            print("Цикл:", exc)
+            # Продолжительная ошибка данных/состояния = запрет новых входов.
+            st["halted"], st["paused"] = True, True
+            try:
+                save_state(st)
+            except Exception as save_exc:
+                print("Не удалось сохранить аварийную остановку:", save_exc)
+            sb.tg(f"🚨 TTSSignBot: авария цикла, новые входы остановлены: {str(exc)[:500]}")
         time.sleep(sb.SCAN_EVERY_SEC)
 
 
