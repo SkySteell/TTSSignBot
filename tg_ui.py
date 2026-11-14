@@ -5,6 +5,7 @@ Telegram-интерфейс с кнопками для автобота (без 
 Пауза / Продолжить, Закрыть всё (с подтверждением).
 """
 import time
+import secrets
 from datetime import datetime, timezone
 
 import requests
@@ -29,9 +30,12 @@ def ago(ts):
 
 
 class TgUI:
-    def __init__(self, ctx, token, chat_id):
+    def __init__(self, ctx, token, chat_id, admin_id):
         self.c = ctx
         self.chat = str(chat_id)
+        self.admin_id = str(admin_id)
+        self.close_token = None
+        self.close_requested_at = 0
         self.api = f"https://api.telegram.org/bot{token}"
         self.offset = 0
 
@@ -81,11 +85,13 @@ class TgUI:
         cq = u.get("callback_query")
         if cq:
             self.call("answerCallbackQuery", callback_query_id=cq["id"])
-            if str(cq["message"]["chat"]["id"]) == self.chat:
+            if (str((cq.get("message") or {}).get("chat", {}).get("id")) == self.chat
+                    and str((cq.get("from") or {}).get("id")) == self.admin_id):
                 self.on_action(cq.get("data", ""))
             return
         m = u.get("message") or {}
-        if str(m.get("chat", {}).get("id")) != self.chat:
+        if (str(m.get("chat", {}).get("id")) != self.chat
+                or str((m.get("from") or {}).get("id")) != self.admin_id):
             return
         self.on_text((m.get("text") or "").strip())
 
@@ -104,26 +110,42 @@ class TgUI:
             self.send(self.status_text())
         elif "Пары" in t:
             self.send(self.pairs_text())
-        elif "Пауза" in t or "Продолжить" in t:
+        elif t == "⏸ Пауза":
             with self.c.lock:
-                self.c.st["paused"] = not self.c.st.get("paused", False)
+                self.c.st["paused"] = True
                 self.c.save()
-                paused = self.c.st["paused"]
-            self.send("⏸ Пауза: новые сделки не открываются, открытые позиции остаются под SL/TP на бирже."
-                      if paused else "▶ Бот снова ищет входы.")
-        elif "Закрыть всё" in t:
-            self.send("Закрыть ВСЕ открытые позиции по рынку?",
-                      self.inline([[("Да, закрыть всё", "closeall:yes"), ("Отмена", "closeall:no")]]))
+            self.send("⏸ Новые входы остановлены. Позиции остаются под защитой на Bybit.")
+        elif t == "▶ Продолжить":
+            with self.c.lock:
+                blocked = self.c.st.get("halted") or self.c.st.get("pending")
+                if not blocked:
+                    self.c.st["paused"] = False
+                    self.c.save()
+            self.send("⛔ Аварийная остановка: сначала требуется сверка с Bybit."
+                      if blocked else "▶ Бот снова ищет входы.")
+        elif t == "🛑 Закрыть всё":
+            self.close_token = secrets.token_urlsafe(8)
+            self.close_requested_at = time.time()
+            self.send("Закрыть ВСЕ открытые позиции по рынку и остановить новые входы?",
+                      self.inline([[("Да, закрыть всё", "closeall:" + self.close_token),
+                                    ("Отмена", "closeall:no")]]))
         else:
             self.send("Выберите действие кнопками внизу.")
 
     def on_action(self, data):
         if data.startswith("stats:"):
             self.send(self.stats_text(data.split(":")[1]))
-        elif data == "closeall:yes":
-            self.send(self.close_all())
         elif data == "closeall:no":
+            self.close_token = None
             self.send("Отменено.")
+        elif data.startswith("closeall:"):
+            token = data.split(":", 1)[1]
+            if (not self.close_token or token != self.close_token
+                    or time.time() - self.close_requested_at > 60):
+                self.send("Подтверждение устарело. Запросите закрытие заново.")
+                return
+            self.close_token = None
+            self.send(self.close_all())
 
     # ---------- тексты ----------
     def stats_text(self, period):
@@ -202,7 +224,9 @@ class TgUI:
         if st.get("paused"):
             flags.append("⏸ пауза")
         if st.get("halted"):
-            flags.append("⛔ остановлен по просадке")
+            flags.append("⛔ аварийная остановка")
+        if st.get("pending"):
+            flags.append("🚨 неразрешённый ордер")
         state = ", ".join(flags) if flags else "✅ работает"
         return (f"ℹ️ Статус: {state}\n"
                 f"Режим: {i['mode']}\n"
@@ -211,7 +235,8 @@ class TgUI:
                 f"Макс. позиций: {i['max_pos']}, проверка каждые {i['scan'] // 60} мин\n"
                 f"Пары: {', '.join(i['symbols'])}\n"
                 f"Последняя проверка: {ago(self.c.meta.get('last_cycle'))}\n"
-                f"Сделок в статистике: {len(st['closed'])}")
+                f"Сделок в новой статистике: {len(st['closed'])}\n"
+                f"Исторических (непроверенных): {len(st.get('legacy_closed', []))}")
 
     def pairs_text(self):
         if not self.c.reasons:
@@ -223,17 +248,44 @@ class TgUI:
     def close_all(self):
         out = []
         with self.c.lock:
+            self.c.st["paused"] = True
+            self.c.save()  # до первого рыночного ордера
             try:
                 ps = self.c.positions()
-            except Exception as e:
-                return f"Не удалось получить позиции: {str(e)[:300]}"
+            except Exception as exc:
+                self.c.st["halted"] = True
+                self.c.save()
+                return f"🚨 Не удалось прочитать позиции: {str(exc)[:250]}"
             if not ps:
-                return "Закрывать нечего: открытых позиций нет."
-            for sym, p in ps.items():
-                d = 1 if str(p.get("side", "")).lower() == "long" else -1
+                return "⏸ Открытых позиций нет. Новые входы поставлены на паузу."
+            errors = []
+            for sym, pos in ps.items():
+                side = str(pos.get("side") or "").lower()
+                if side not in ("long", "short"):
+                    errors.append(f"{sym}: неизвестное направление")
+                    continue
+                d = 1 if side == "long" else -1
                 try:
-                    self.c.close_market(sym, _f(p.get("contracts")), d)
-                    out.append(f"✅ {sym}: закрыта по рынку")
-                except Exception as e:
-                    out.append(f"🚨 {sym}: не закрылась: {str(e)[:200]}")
-        return "🛑 Закрытие всех позиций:\n" + "\n".join(out)
+                    self.c.close_market(sym, _f(pos.get("contracts")), d)
+                    out.append(f"⏳ {sym}: отправлено закрытие")
+                except Exception as exc:
+                    errors.append(f"{sym}: {str(exc)[:200]}")
+            try:
+                for _ in range(5):
+                    if not self.c.positions():
+                        break
+                    time.sleep(1)
+                remaining = list(self.c.positions())
+            except Exception as exc:
+                remaining = ["невозможно проверить позиции"]
+                errors.append(str(exc)[:200])
+            if remaining:
+                errors.append("Не закрыты / не подтверждены: " + ", ".join(remaining))
+            if errors:
+                self.c.st["halted"] = True
+                out += ["🚨 " + e for e in errors]
+            else:
+                out.append("✅ Все позиции подтверждены закрытыми на бирже.")
+            self.c.save()
+        out.append("⏸ Новые входы остановлены. Возобновление — вручную после проверки.")
+        return "\n".join(out)

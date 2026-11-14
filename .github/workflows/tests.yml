@@ -1,0 +1,20 @@
+name: Safety unit tests
+on:
+  pull_request:
+  push:
+    branches:
+      - "audit/**"
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q bot.py tg_ui.py bybit_futures_signal_bot.py bybit_futures_trader.py
+      - name: Run offline safety regression tests
+        run: python -m unittest discover -s tests -v

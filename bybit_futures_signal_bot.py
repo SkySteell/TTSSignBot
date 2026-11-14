@@ -26,14 +26,21 @@ import pandas as pd
 import requests
 
 # ======================= НАСТРОЙКИ =======================
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "KAS/USDT:USDT"]
+# Снимок топ-10 по капитализации на 14.11.2026 (без стейблкоинов и обёрток) + KAS.
+# Проверка активных USDT linear perpetual-контрактов выполняется при старте.
+SYMBOLS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT",
+    "XRP/USDT:USDT", "SOL/USDT:USDT", "TRX/USDT:USDT",
+    "HYPE/USDT:USDT", "ZEC/USDT:USDT", "XMR/USDT:USDT",
+    "DOGE/USDT:USDT", "KAS/USDT:USDT",
+]
 BTC_SYMBOL = "BTC/USDT:USDT"
 TF, HTF = "1h", "4h"
 LIMIT = 300
 
-CAPITAL = float(os.getenv("CAPITAL", "15"))  # капитал в USDT
+CAPITAL = float(os.getenv("CAPITAL", "150"))  # капитал в USDT
 RISK_PCT = 0.01          # плановый риск на сделку: 1% капитала
-HARD_RISK_PCT = 0.02     # потолок риска, если мин. лот заставляет рисковать больше плана
+HARD_RISK_PCT = RISK_PCT   # превышать 1% нельзя даже из-за минимального лота
 MAX_LEVERAGE = 3         # потолок «умеренного» плеча (по номиналу позиции / капиталу)
 MARGIN_SHARE = 0.5       # одна позиция занимает не больше 50% капитала как маржа
 MMR = 0.005              # грубая оценка maintenance margin для расчёта ликвидации
@@ -108,9 +115,15 @@ def size_position(price, dist, d, market):
     step = market.get("step") or 0.001
     min_amt = market.get("min_amt") or step
     min_cost = market.get("min_cost") or 0.0
-    cap_notional = CAPITAL * MAX_LEVERAGE
+    # Ограничение номинала учитывает И плечо, И 50% капитала на маржу.
+    cap_notional = CAPITAL * MAX_LEVERAGE * MARGIN_SHARE
 
-    qty = (CAPITAL * RISK_PCT) / dist
+    # В риск включаем ожидаемые комиссии и проскальзывание на входе/выходе.
+    # Это оценка, не гарантия ограничения потерь на гэпах и резком рынке.
+    if price <= 0 or dist <= 0 or CAPITAL <= 0 or step <= 0:
+        return None, "некорректные данные цены, стопа, капитала или лота"
+    effective_dist = dist + price * RT_COST
+    qty = (CAPITAL * RISK_PCT) / effective_dist
     if qty * price > cap_notional:
         qty = cap_notional / price
     qty = math.floor(qty / step + 1e-9) * step
@@ -123,8 +136,8 @@ def size_position(price, dist, d, market):
         flags.append("мин. сумма ордера выше плана")
     qty = round(qty, 8)
 
-    risk = qty * dist
-    if risk > CAPITAL * HARD_RISK_PCT:
+    risk = qty * effective_dist
+    if risk > CAPITAL * HARD_RISK_PCT + 1e-9:
         return None, (f"минимальный лот требует риска {risk:.2f} USDT "
                       f"({risk / CAPITAL:.1%} капитала): пропуск")
     notional = qty * price
@@ -133,6 +146,8 @@ def size_position(price, dist, d, market):
 
     lev = max(1, math.ceil(notional / (CAPITAL * MARGIN_SHARE)))
     margin = notional / lev
+    if lev > MAX_LEVERAGE:
+        return None, "плечо превышает установленный предел"
     liq = price * (1 - 1 / lev + MMR) if d == 1 else price * (1 + 1 / lev - MMR)
     if abs(price - liq) < 2 * dist:
         return None, "ликвидация слишком близко к стопу: пропуск"
