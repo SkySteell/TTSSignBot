@@ -112,6 +112,19 @@ class TradingSafetyTests(unittest.TestCase):
         self.assertTrue(st["halted"])
         self.assertTrue(st["paused"])
 
+    def test_live_mode_is_unconditionally_disabled(self):
+        with patch.object(trader, "MODE", "live"):
+            with self.assertRaisesRegex(RuntimeError, "только MODE=demo"):
+                trader.make_exchange()
+
+    def test_existing_stop_file_blocks_new_entries(self):
+        st = self.base()
+        with tempfile.TemporaryDirectory() as td:
+            stop = Path(td) / "STOP"
+            stop.touch()
+            with patch.object(trader, "STOP_FILE", stop):
+                self.assertEqual(trader.risk_gate(st, 150), "файл STOP")
+
     def test_account_margin_isolated_before_leverage(self):
         ex = Mock()
         ex.private_get_v5_account_info.return_value = {
