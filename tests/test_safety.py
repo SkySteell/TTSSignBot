@@ -112,6 +112,28 @@ class TradingSafetyTests(unittest.TestCase):
         self.assertTrue(st["halted"])
         self.assertTrue(st["paused"])
 
+    def test_account_margin_isolated_before_leverage(self):
+        ex = Mock()
+        ex.private_get_v5_account_info.return_value = {
+            "retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}
+        }
+        ex.fetch_positions.return_value = [{
+            "symbol": "BTC/USDT:USDT", "contracts": 0,
+            "leverage": 3, "info": {"positionIdx": 0},
+        }]
+        trader.ensure_margin_and_leverage(ex, "BTC/USDT:USDT", 3)
+        ex.set_leverage.assert_called_once_with(3, "BTC/USDT:USDT")
+        ex.set_margin_mode.assert_not_called()
+
+    def test_account_cross_margin_blocks_entry(self):
+        ex = Mock()
+        ex.private_get_v5_account_info.return_value = {
+            "retCode": 0, "result": {"marginMode": "REGULAR_MARGIN"}
+        }
+        with self.assertRaises(RuntimeError):
+            trader.ensure_margin_and_leverage(ex, "BTC/USDT:USDT", 3)
+        ex.set_leverage.assert_not_called()
+
     def test_unknown_create_order_is_not_retried(self):
         ex = Mock()
         ex.fetch_ticker.return_value = {"last": 100}
