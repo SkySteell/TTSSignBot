@@ -89,7 +89,7 @@ def equity(ex):
 def open_positions(ex):
     """Только позиции one-way USDT linear; неоднозначные режимы запрещены."""
     out = {}
-    for p in ex.fetch_positions():
+    for p in ex.fetch_positions(params={"settleCoin": "USDT"}):
         if float(p.get("contracts") or 0) <= 0:
             continue
         sym = p["symbol"]
