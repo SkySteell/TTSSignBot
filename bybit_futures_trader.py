@@ -234,63 +234,160 @@ def open_trade(ex, sig):
 
 # ---------------- СОСТОЯНИЕ И ЛИМИТЫ ----------------
 def load_state():
-    base = {"last": {}, "open": {}, "closed": [], "day": "", "day_start": 0.0,
-            "peak": 0.0, "halted": False, "notified_day": "", "paused": False}
-    try:
-        st = json.loads(STATE_FILE.read_text())
-    except Exception:
+    base = {
+        "schema_version": 2, "last": {}, "open": {}, "closed": [],
+        "legacy_closed": [], "pending": None, "day": "", "day_start": 0.0,
+        "peak": 0.0, "halted": False, "notified_day": "", "paused": False,
+    }
+    if not STATE_FILE.exists():
         return base
+    try:
+        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(st, dict):
+            raise ValueError("ожидался JSON объект")
+    except (OSError, ValueError) as exc:
+        # Не начинать торговлю с пустым состоянием после порчи файла.
+        raise RuntimeError(f"Файл состояния повреждён: {exc}. Проверьте Bybit и восстановите файл") from exc
+    if st.get("schema_version", 1) < 2:
+        # Старые 9 сделок рассчитаны по общей дельте баланса: не смешивать с новым PnL.
+        st["legacy_closed"] = st.get("closed", [])
+        st["closed"] = []
+        st["schema_version"] = 2
     for k, v in base.items():
         st.setdefault(k, v)
-    # старый формат (просто числа R) -> записи со временем
-    st["closed"] = [c if isinstance(c, dict) else
-                    {"ts": 0, "symbol": "?", "side": "?", "r": float(c), "pnl": 0.0}
-                    for c in st["closed"]]
+    if not isinstance(st["open"], dict):
+        raise RuntimeError("Некорректная структура открытых сделок в состоянии")
     return st
 
 
 def save_state(st):
-    STATE_FILE.write_text(json.dumps(st))
+    """Атомарная запись: при рестарте нельзя читать наполовину записанный JSON."""
+    import tempfile
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(st, ensure_ascii=False, allow_nan=False)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(STATE_FILE.parent),
+            prefix=".trader_", suffix=".tmp", delete=False,
+        ) as tmp:
+            temp_path = Path(tmp.name)
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(temp_path, STATE_FILE)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def risk_gate(st, eq):
-    """Возвращает причину запрета новых сделок или None."""
+    """Запрещает новые входы. База лимитов ограничена торговым капиталом."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if st["day"] != today:
         st["day"], st["day_start"] = today, eq
-    st["peak"] = max(st["peak"], eq)
+        st["notified_day"] = ""
+    st["peak"] = max(float(st["peak"]), eq)
     if STOP_FILE.exists():
         return "файл STOP"
+    if st.get("pending"):
+        return "незавершённая отправка ордера, требуется проверка на Bybit"
     if st["halted"]:
-        return "остановка по просадке (удалите trader_state.json после разбора)"
-    if st["peak"] > 0 and eq < st["peak"] * (1 - MAX_DRAWDOWN):
+        return "аварийная остановка (сначала проверить биржу и состояние)"
+    peak_base = min(CAPITAL_CAP, float(st["peak"]))
+    daily_base = min(CAPITAL_CAP, float(st["day_start"]))
+    if peak_base > 0 and float(st["peak"]) - eq > peak_base * MAX_DRAWDOWN:
         st["halted"] = True
-        return f"просадка от пика более {MAX_DRAWDOWN:.0%}: бот остановлен"
-    if st["day_start"] > 0 and eq < st["day_start"] * (1 - DAILY_LOSS_LIMIT):
+        return f"просадка торгового капитала более {MAX_DRAWDOWN:.0%}: ручная остановка"
+    if daily_base > 0 and float(st["day_start"]) - eq > daily_base * DAILY_LOSS_LIMIT:
         return f"дневной лимит убытка {DAILY_LOSS_LIMIT:.0%}: пауза до завтра"
     return None
 
 
+def fetch_trade_closed_pnl(ex, sym, trade):
+    """Возвращает (pnl, количество) или None, пока биржа не подтвердила закрытие.
+
+    Записи о закрытии отдельной позиции берутся с Bybit V5 Closed PnL, а не из
+    разницы баланса всего счёта. При частичных закрытиях суммируются строки.
+    """
+    opened_ms = int(trade.get("opened_ms") or 0)
+    qty = float(trade.get("qty") or 0)
+    if not opened_ms or qty <= 0:
+        return None
+    end_ms = int(time.time() * 1000)
+    start_ms = max(opened_ms - 5000, end_ms - 7 * 86400 * 1000 + 1)
+    params = {"category": "linear", "symbol": ex.market_id(sym),
+              "startTime": start_ms, "endTime": end_ms, "limit": 100}
+    rows = []
+    cursor = None
+    for _ in range(5):
+        if cursor:
+            params["cursor"] = cursor
+        resp = ex.private_get_v5_position_closed_pnl(params)
+        if str(resp.get("retCode", 0)) != "0":
+            raise RuntimeError(f"Bybit Closed PnL: {resp.get('retMsg')}")
+        result = resp.get("result") or {}
+        rows.extend(result.get("list") or [])
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+    else:
+        raise RuntimeError(f"{sym}: история закрытий длиннее 5 страниц")
+    candidates = [
+        r for r in rows
+        if int(r.get("createdTime") or r.get("updatedTime") or 0) >= opened_ms - 5000
+        and float(r.get("closedSize") or 0) > 0
+    ]
+    total_qty = sum(float(r.get("closedSize") or 0) for r in candidates)
+    # Не приписываем PnL чужих операций: требуем соответствие объёма.
+    step = float((ex.market(sym).get("precision") or {}).get("amount") or 0)
+    tolerance = max(step / 2, qty * 0.00001, 1e-10)
+    if abs(total_qty - qty) > tolerance:
+        return None
+    return sum(float(r["closedPnl"]) for r in candidates), total_qty
+
+
 def manage_open(ex, st, positions):
-    """Закрытия по SL/TP фиксирует сама биржа; бот сообщает итог и режет по таймауту."""
+    """Проверяет таймаут и записывает только подтверждённый биржевой PnL."""
     for sym in list(st["open"]):
-        t = st["open"][sym]
+        trade = st["open"][sym]
         if sym not in positions:
-            eq = equity(ex)
-            delta = eq - t["equity_open"]
-            r_est = delta / (t["qty"] * t["dist"]) if t["qty"] * t["dist"] else 0.0
-            st["closed"].append({"ts": int(time.time()), "symbol": sym, "side": t.get("side", "?"),
-                                 "r": r_est, "pnl": delta})
-            sb.tg(f"{'✅' if delta > 0 else '❌'} {sym} закрыта (SL/TP или вручную)\n"
-                  f"Изменение баланса {delta:+.3f} USDT (≈{r_est:+.2f}R)\nБаланс {eq:.2f} USDT\n"
-                  + sb.stats_line([c["r"] for c in st["closed"]]))
+            value = fetch_trade_closed_pnl(ex, sym, trade)
+            if value is None:
+                REASONS[sym] = "закрытие ожидает сверки Closed PnL Bybit"
+                continue
+            pnl, closed_qty = value
+            nominal_risk = float(trade.get("risk_usdt") or
+                                 (float(trade["qty"]) * float(trade["dist"])))
+            r_est = pnl / nominal_risk if nominal_risk > 0 else 0
+            ids = f"{sym}:{trade.get('opened_ms')}"
+            if not any(c.get("trade_id") == ids for c in st["closed"]):
+                st["closed"].append({
+                    "trade_id": ids, "ts": int(time.time()), "symbol": sym,
+                    "side": trade.get("side", "?"), "r": r_est, "pnl": pnl,
+                    "closed_qty": closed_qty, "source": "bybit_closed_pnl",
+                })
+                save_state(st)
+                sb.tg(
+                    f"{'✅' if pnl > 0 else '❌'} {sym} закрыта. "
+                    f"Bybit Closed PnL: {pnl:+.3f} USDT ({r_est:+.2f}R)\n"
+                    + sb.stats_line([c["r"] for c in st["closed"]])
+                )
             del st["open"][sym]
-        elif time.time() * 1000 - t["opened_ms"] > sb.MAX_HOLD * 3_600_000:
+            save_state(st)
+        elif time.time() * 1000 - int(trade["opened_ms"]) > sb.MAX_HOLD * 3_600_000:
             try:
-                close_market(ex, sym, float(positions[sym]["contracts"]), t["d"])
-                sb.tg(f"⏱ {sym}: таймаут {sb.MAX_HOLD} свечей, позиция закрыта по рынку")
-            except Exception as e:
-                sb.tg(f"🚨 {sym}: не удалось закрыть по таймауту: {e}")
+                pos = positions[sym]
+                if str(pos.get("side") or "").lower() != ("long" if trade["d"] == 1 else "short"):
+                    raise UnsafeTradeError("сторона позиции отличается от записанной")
+                close_market(ex, sym, float(pos["contracts"]), trade["d"])
+                sb.tg(f"⏱ {sym}: таймаут {sb.MAX_HOLD} ч, отправлено закрытие по рынку; ждём подтверждения")
+            except Exception as exc:
+                st["halted"] = True
+                st["paused"] = True
+                save_state(st)
+                sb.tg(f"🚨 {sym}: закрытие по таймауту не подтверждено: {exc}. Новые входы остановлены")
+                raise
 
 
 # ---------------- ОСНОВНОЙ ЦИКЛ ----------------
