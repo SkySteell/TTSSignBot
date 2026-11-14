@@ -1,0 +1,11 @@
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+trader_state.json
+trader_state.json.*
+futures_bot_state.json
+STOP
+*.tmp
