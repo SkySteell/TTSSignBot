@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Точка входа для Bothost.
-  * Если заданы BYBIT_KEY и BYBIT_SECRET: автоторговля (MODE=demo по умолчанию).
+  * При наличии BYBIT_KEY и BYBIT_SECRET: ТОЛЬКО демоторговля (MODE=demo).
   * Если ключей нет: только сигналы в Telegram (ключи Bybit не нужны).
 Переменные окружения (вводятся в панели Bothost, НЕ в код):
-  TG_TOKEN, TG_CHAT_ID, CAPITAL (по умолчанию 15), BYBIT_KEY, BYBIT_SECRET, MODE
+  TG_TOKEN, TG_CHAT_ID, TG_ADMIN_ID, CAPITAL (по умолчанию 150), BYBIT_KEY, BYBIT_SECRET, MODE
 """
 import os
 import sys
 
-import requests
 
 try:
     sys.stdout.reconfigure(line_buffering=True)  # чтобы логи Bothost появлялись сразу
@@ -21,14 +20,9 @@ import bybit_futures_signal_bot as sb
 trading = bool(os.getenv("BYBIT_KEY") and os.getenv("BYBIT_SECRET"))
 mode = os.getenv("MODE", "demo").upper() if trading else "ТОЛЬКО СИГНАЛЫ"
 
-try:
-    ip = requests.get("https://api.ipify.org", timeout=8).text
-    print(f"Исходящий IP сервера: {ip} (нужен для привязки боевого ключа Bybit)")
-except Exception as e:
-    print("IP определить не удалось:", e)
 
-VERSION = "v3: кнопки Telegram, исправление прав ключа (UTA)"
-sb.tg(f"Запуск на Bothost. Версия: {VERSION}. Режим: {mode}. Капитал {os.getenv('CAPITAL', '15')} USDT.")
+VERSION = "v4: безопасный DEMO 150 USDT, 11 пар, сверка с биржей"
+sb.tg(f"Запуск на Bothost. Версия: {VERSION}. Режим: {mode}. Капитал {os.getenv('CAPITAL', '150')} USDT.")
 
 import traceback
 
