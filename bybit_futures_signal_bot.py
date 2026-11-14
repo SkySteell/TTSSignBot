@@ -115,7 +115,7 @@ def size_position(price, dist, d, market):
     step = market.get("step") or 0.001
     min_amt = market.get("min_amt") or step
     min_cost = market.get("min_cost") or 0.0
-    cap_notional = CAPITAL * MAX_LEVERAGE
+    # Ограничение номинала учитывает И плечо, И 50% капитала на маржу.\n    cap_notional = CAPITAL * MAX_LEVERAGE * MARGIN_SHARE
 
     # В риск включаем ожидаемые комиссии и проскальзывание на входе/выходе.
     # Это оценка, не гарантия ограничения потерь на гэпах и резком рынке.
