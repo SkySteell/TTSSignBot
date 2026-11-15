@@ -8,7 +8,7 @@
   2) ищет два сетапа: откат по тренду и пробой с объёмом (лонг и шорт);
   3) считает стоп, цель, размер позиции, плечо, оценку ликвидации под ваш капитал;
   4) присылает сигнал в Telegram и ведёт ПАПЕР-ТРЕКЕР: сам проверяет, чем
-     закончился каждый сигнал (стоп/цель/таймаут), и считает статистику в R
+     закончился каждый сигнал (стоп/цель/таймаут), и считает статистику в USDT
      после комиссий. Это даёт честные данные, прежде чем рисковать деньгами.
 
 Установка:  pip install ccxt pandas numpy requests
@@ -226,7 +226,7 @@ def evaluate(symbol, df, htf, btc_dir, funding, market):
         stop = price - d * dist
     cost_r = RT_COST / (dist / price)
     if cost_r > MAX_COST_R:
-        return None, f"издержки {cost_r:.2f}R > {MAX_COST_R}R: стоп слишком узкий"
+        return None, "расчётные издержки превышают 25% риска: стоп слишком узкий"
     if funding is not None and d * funding > FUNDING_SKIP:
         return None, f"фандинг {funding:.3%} против позиции"
     target = price + d * RR * dist
@@ -234,7 +234,7 @@ def evaluate(symbol, df, htf, btc_dir, funding, market):
     pos, reason = size_position(price, dist, d, market)
     if pos is None:
         return None, reason
-    why.append(f"ADX {adx_v:.0f} ≥ {ADX_MIN}; издержки {cost_r:.2f}R")
+    why.append(f"ADX {adx_v:.0f} ≥ {ADX_MIN}; ожидаемые издержки {pos['qty'] * price * RT_COST:.3f} USDT")
     return {"symbol": symbol, "side": "LONG" if d == 1 else "SHORT", "d": d, "setup": setup,
             "price": price, "stop": stop, "target": target, "dist": dist, "cost_r": cost_r,
             "bar_ts": int(df["ts"].iloc[-1]), "funding": funding, "why": why, **pos}, ""
@@ -242,34 +242,42 @@ def evaluate(symbol, df, htf, btc_dir, funding, market):
 
 # ======================= ПАПЕР-ТРЕКЕР =======================
 def resolve(trade, df):
-    """Проверяет свечи после входа. Возвращает (R | None, причина, цена выхода)."""
-    d, entry, stop, target, dist = trade["d"], trade["price"], trade["stop"], trade["target"], trade["dist"]
+    """Виртуальный результат в USDT с оценочными издержками, без реального исполнения."""
+    d, entry, stop, target = trade["d"], trade["price"], trade["stop"], trade["target"]
+    qty = float(trade["qty"])
     bars = 0
     for _, row in df[df["ts"] > trade["bar_ts"]].iterrows():
         bars += 1
         hit_stop = row["low"] <= stop if d == 1 else row["high"] >= stop
         hit_tp = row["high"] >= target if d == 1 else row["low"] <= target
         px, why = None, None
-        if hit_stop:  # консервативно: при касании обоих первым считаем стоп
+        if hit_stop:  # Если свеча касается обоих уровней, считаем сначала стоп.
             px, why = stop, "стоп"
         elif hit_tp:
             px, why = target, "цель"
         elif bars >= MAX_HOLD:
             px, why = float(row["close"]), "таймаут"
         if px is not None:
-            r = d * (px - entry) / dist - entry * RT_COST / dist
-            return r, why, px
+            # Модель комиссий/проскальзывания, не биржевой Closed PnL.
+            pnl = d * (px - entry) * qty - entry * qty * RT_COST
+            return pnl, why, px
     return None, "", None
 
 
 def stats_line(closed):
+    """Сводка денежных результатов в USDT, а не нормированных единиц риска."""
     if not closed:
-        return "статистика: пока нет закрытых сигналов"
-    r = np.array(closed)
-    wins, losses = r[r > 0].sum(), -r[r < 0].sum()
-    pf = wins / losses if losses > 0 else float("inf")
-    return (f"статистика: {len(r)} сигн., винрейт {(r > 0).mean():.0%}, ср.R {r.mean():+.2f}, "
-            f"итого {r.sum():+.1f}R, PF {pf:.2f}")
+        return "статистика: пока нет закрытых сделок"
+    amounts = [float(value) for value in closed]
+    wins = sum(v for v in amounts if v > 0)
+    losses = -sum(v for v in amounts if v < 0)
+    pf = f"{wins / losses:.2f}" if losses > 0 else ("∞" if wins > 0 else "—")
+    return (
+        f"статистика: {len(amounts)} сд., "
+        f"винрейт {sum(v > 0 for v in amounts) / len(amounts):.0%}, "
+        f"средний {sum(amounts) / len(amounts):+.3f} USDT, "
+        f"итого {sum(amounts):+.3f} USDT, PF {pf}"
+    )
 
 
 # ======================= ВВОД-ВЫВОД =======================
@@ -300,13 +308,13 @@ def signal_text(s):
         f"{emoji} {s['symbol']}  {s['side']}  [{TF}]  {s['setup']}",
         f"Вход ~ {fmt(s['price'])} (лимитка у этой цены, не гнаться)",
         f"Стоп: {fmt(s['stop'])}  ({s['dist'] / s['price']:.2%} от цены)",
-        f"Цель: {fmt(s['target'])}  (R:R 1:{RR:g})",
+        f"Цель: {fmt(s['target'])}  (плановая прибыль ~{s['qty'] * s['dist'] * RR - s['qty'] * s['price'] * RT_COST:+.3f} USDT)",
         f"Объём: {s['qty']:g} (номинал {s['notional']:.2f} USDT)",
         f"Изолированная маржа, плечо {s['lev']}x: маржа {s['margin']:.2f} USDT",
         f"Риск: {s['risk']:.2f} USDT ({s['risk_pct']:.1%} капитала)",
         f"Ликвидация (оценка): {fmt(s['liq'])}  | фандинг {fund}",
         "Условия входа:", *[f"• {w}" for w in s["why"]],
-        "План: после +1R можно подтянуть стоп в безубыток. Стоп ставить сразу с входом.",
+        "План: при движении цены на расстояние стопа можно подтянуть стоп в безубыток. Стоп ставить сразу с входом.",
     ]
     if s["flags"]:
         lines.append("⚠ " + "; ".join(s["flags"]))
