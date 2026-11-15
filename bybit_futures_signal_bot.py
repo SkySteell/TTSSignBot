@@ -322,10 +322,27 @@ def signal_text(s):
 
 
 def load_state():
+    """Старые виртуальные результаты в R не конвертируем без объёма сделки."""
+    base = {
+        "schema_version": 2, "last": {}, "open": [], "closed": [],
+        "legacy_closed": [], "legacy_open": [],
+    }
+    if not STATE_FILE.exists():
+        return base
     try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {"last": {}, "open": [], "closed": []}
+        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(st, dict):
+            raise ValueError("состояние должно быть словарём")
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"Некорректное состояние виртуальных сделок: {exc}") from exc
+    if st.get("schema_version", 1) < 2:
+        st["legacy_closed"] = st.get("closed", [])
+        st["legacy_open"] = st.get("open", [])
+        st["closed"], st["open"] = [], []
+        st["schema_version"] = 2
+    for key, value in base.items():
+        st.setdefault(key, value)
+    return st
 
 
 def save_state(st):
@@ -372,13 +389,17 @@ def main():
                     if t["symbol"] != sym:
                         still.append(t)
                         continue
-                    r, why, px = resolve(t, df)
-                    if r is None:
+                    pnl, why, px = resolve(t, df)
+                    if pnl is None:
                         still.append(t)
                     else:
-                        st["closed"].append(r)
-                        tg(f"{'✅' if r > 0 else '❌'} {sym} {t['side']} закрыт: {why}, {r:+.2f}R "
-                           f"(после комиссий)\n{stats_line(st['closed'])}")
+                        st["closed"].append({
+                            "ts": int(time.time()), "symbol": sym, "pnl": pnl,
+                            "side": t["side"], "reason": why, "source": "paper_estimate",
+                        })
+                        tg(f"{'✅' if pnl > 0 else '❌'} {sym} {t['side']} закрыт: {why}, "
+                           f"{pnl:+.3f} USDT (виртуально, с оценочными издержками)\n"
+                           + stats_line([x["pnl"] for x in st["closed"]]))
                 st["open"] = still
                 # 2) новый сигнал
                 if any(t["symbol"] == sym for t in st["open"]):
@@ -394,7 +415,7 @@ def main():
                 if sig:
                     tg(signal_text(sig))
                     st["open"].append({k: sig[k] for k in
-                                       ("symbol", "side", "d", "price", "stop", "target", "dist", "bar_ts")})
+                                       ("symbol", "side", "d", "price", "stop", "target", "dist", "bar_ts", "qty")})
                     st["last"][sym] = sig["bar_ts"]
                 else:
                     print(f"[{sym}] нет сигнала: {reason}")
