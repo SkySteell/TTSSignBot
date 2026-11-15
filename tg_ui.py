@@ -150,34 +150,50 @@ class TgUI:
     # ---------- тексты ----------
     def stats_text(self, period):
         if period == "today":
-            start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            start = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
             label = "сегодня (UTC)"
         elif period in ("7", "30"):
             start, label = time.time() - int(period) * 86400, f"{period} дней"
         else:
             start, label = 0, "всё время"
         with self.c.lock:
-            rows = [x for x in self.c.st["closed"] if x["ts"] >= start] if start else list(self.c.st["closed"])
+            rows = [
+                x for x in self.c.st["closed"]
+                if (not start or x.get("ts", 0) >= start) and x.get("pnl") is not None
+            ]
         if not rows:
             return f"📊 Статистика, {label}: закрытых сделок нет."
-        r = [x["r"] for x in rows]
-        wins = sum(v for v in r if v > 0)
-        losses = -sum(v for v in r if v < 0)
-        pf = f"{wins / losses:.2f}" if losses > 0 else "∞"
-        pnl = sum(x.get("pnl", 0.0) for x in rows)
-        by = {}
-        for x in rows:
-            n, s = by.get(x["symbol"], (0, 0.0))
-            by[x["symbol"]] = (n + 1, s + x["r"])
-        lines = [f"📊 Статистика, {label}",
-                 f"Сделок: {len(r)}  |  винрейт {sum(v > 0 for v in r) / len(r):.0%}",
-                 f"Средний результат: {sum(r) / len(r):+.2f}R  |  итого {sum(r):+.2f}R",
-                 f"Profit factor: {pf}",
-                 f"Лучшая {max(r):+.2f}R  |  худшая {min(r):+.2f}R",
-                 f"Результат в деньгах: {pnl:+.3f} USDT", "По парам:"]
-        lines += [f"• {s}: {n} сд., {v:+.2f}R" for s, (n, v) in sorted(by.items())]
-        if len(r) < 30:
-            lines.append(f"\nВыборка мала ({len(r)} из 30 нужных): выводы делать рано.")
+        # Денежные результаты берутся из подтверждённого Bybit Closed PnL.
+        # Не используем старое поле 'r' для расчёта финансовой статистики.
+        amounts = [float(x["pnl"]) for x in rows]
+        gains = sum(v for v in amounts if v > 0)
+        losses = -sum(v for v in amounts if v < 0)
+        pf = f"{gains / losses:.2f}" if losses > 0 else ("∞" if gains > 0 else "—")
+        total = sum(amounts)
+        by_pair = {}
+        for item, pnl in zip(rows, amounts):
+            sym = item.get("symbol", "?")
+            count, subtotal = by_pair.get(sym, (0, 0.0))
+            by_pair[sym] = (count + 1, subtotal + pnl)
+        lines = [
+            f"📊 Статистика, {label}",
+            f"Сделок: {len(amounts)}  |  винрейт {sum(v > 0 for v in amounts) / len(amounts):.0%}",
+            f"Средний результат: {total / len(amounts):+.3f} USDT",
+            f"Общий результат: {total:+.3f} USDT",
+            f"Profit Factor: {pf}",
+            f"Лучшая: {max(amounts):+.3f} USDT  |  худшая: {min(amounts):+.3f} USDT",
+            "По парам:",
+        ]
+        lines += [
+            f"• {sym}: {count} сд., {subtotal:+.3f} USDT"
+            for sym, (count, subtotal) in sorted(by_pair.items())
+        ]
+        if len(amounts) < 30:
+            lines.append(
+                f"\nВыборка мала ({len(amounts)} из 30 нужных): выводы делать рано."
+            )
         return "\n".join(lines)
 
     def positions_text(self):

@@ -21,7 +21,7 @@ trading = bool(os.getenv("BYBIT_KEY") and os.getenv("BYBIT_SECRET"))
 mode = os.getenv("MODE", "demo").upper() if trading else "ТОЛЬКО СИГНАЛЫ"
 
 
-VERSION = "v4: безопасный DEMO 150 USDT, 11 пар, сверка с биржей"
+VERSION = "v4.1: DEMO 150 USDT, 11 пар, статистика в USDT"
 sb.tg(f"Запуск на Bothost. Версия: {VERSION}. Режим: {mode}. Капитал {os.getenv('CAPITAL', '150')} USDT.")
 
 import traceback

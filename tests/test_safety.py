@@ -44,6 +44,69 @@ class SignalRiskTests(unittest.TestCase):
         self.assertIsNone(pos)
 
 
+
+class MonetaryStatisticsTests(unittest.TestCase):
+    def test_summary_uses_usdt_instead_of_r(self):
+        summary = sb.stats_line([1.20, -0.80, 0.05])
+        self.assertIn("итого +0.450 USDT", summary)
+        self.assertIn("средний +0.150 USDT", summary)
+        self.assertIn("PF 1.56", summary)
+        self.assertNotIn("ср.R", summary)
+        self.assertNotIn("R,", summary)
+
+    def test_telegram_report_uses_actual_pnl_for_every_pair(self):
+        ui = TgUI(
+            SimpleNamespace(
+                st={"closed": [
+                    {"ts": 2000000000, "symbol": "SOL/USDT:USDT", "pnl": 1.210, "r": 9},
+                    {"ts": 2000000000, "symbol": "KAS/USDT:USDT", "pnl": -0.700, "r": -9},
+                    {"ts": 2000000000, "symbol": "SOL/USDT:USDT", "pnl": 0.250, "r": 3},
+                ]},
+                lock=__import__("threading").RLock(),
+            ),
+            "FAKE-TOKEN", "42", "42",
+        )
+        report = ui.stats_text("all")
+        self.assertIn("Общий результат: +0.760 USDT", report)
+        self.assertIn("Средний результат: +0.253 USDT", report)
+        self.assertIn("Лучшая: +1.210 USDT", report)
+        self.assertIn("худшая: -0.700 USDT", report)
+        self.assertIn("SOL/USDT:USDT: 2 сд., +1.460 USDT", report)
+        self.assertIn("KAS/USDT:USDT: 1 сд., -0.700 USDT", report)
+        self.assertIn("Profit Factor: 2.09", report)
+        self.assertNotIn("+9.00R", report)
+        self.assertNotIn("R", report)
+
+    def test_paper_trade_uses_contract_quantity_in_usdt(self):
+        trade = {
+            "symbol": "SOL/USDT:USDT", "price": 100, "stop": 98,
+            "target": 104, "qty": 0.5, "d": 1,
+            "bar_ts": 1000,
+        }
+        df = sb.pd.DataFrame([{
+            "ts": 2000, "low": 95, "high": 105, "close": 99,
+        }])
+        pnl, why, price = sb.resolve(trade, df)
+        self.assertEqual(why, "стоп")
+        self.assertEqual(price, 98)
+        self.assertAlmostEqual(pnl, -1.0 - (100 * 0.5 * sb.RT_COST))
+
+    def test_legacy_paper_r_history_not_converted_to_money(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "paper_state.json"
+            path.write_text(json.dumps({
+                "closed": [2.67], "open": [
+                    {"symbol": "SOL/USDT:USDT", "price": 100, "bar_ts": 1}
+                ],
+                "last": {},
+            }), encoding="utf-8")
+            with patch.object(sb, "STATE_FILE", path):
+                st = sb.load_state()
+                self.assertEqual(st["closed"], [])
+                self.assertEqual(st["legacy_closed"], [2.67])
+                self.assertEqual(st["open"], [])
+                self.assertEqual(len(st["legacy_open"]), 1)
+
 class TradingSafetyTests(unittest.TestCase):
     def setUp(self):
         trader.CAPITAL_CAP = 150

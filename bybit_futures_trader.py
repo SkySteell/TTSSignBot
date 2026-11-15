@@ -362,21 +362,20 @@ def manage_open(ex, st, positions):
                 REASONS[sym] = "закрытие ожидает сверки Closed PnL Bybit"
                 continue
             pnl, closed_qty = value
-            nominal_risk = float(trade.get("risk_usdt") or
-                                 (float(trade["qty"]) * float(trade["dist"])))
-            r_est = pnl / nominal_risk if nominal_risk > 0 else 0
             ids = f"{sym}:{trade.get('opened_ms')}"
             if not any(c.get("trade_id") == ids for c in st["closed"]):
                 st["closed"].append({
                     "trade_id": ids, "ts": int(time.time()), "symbol": sym,
-                    "side": trade.get("side", "?"), "r": r_est, "pnl": pnl,
+                    "side": trade.get("side", "?"), "pnl": pnl,
                     "closed_qty": closed_qty, "source": "bybit_closed_pnl",
                 })
                 save_state(st)
                 sb.tg(
                     f"{'✅' if pnl > 0 else '❌'} {sym} закрыта. "
-                    f"Bybit Closed PnL: {pnl:+.3f} USDT ({r_est:+.2f}R)\n"
-                    + sb.stats_line([c["r"] for c in st["closed"]])
+                    f"Результат Bybit Closed PnL: {pnl:+.3f} USDT\n"
+                    + sb.stats_line([
+                        float(c["pnl"]) for c in st["closed"] if c.get("pnl") is not None
+                    ])
                 )
             del st["open"][sym]
             save_state(st)
