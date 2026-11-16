@@ -174,7 +174,7 @@ def emergency_flatten(ex, sym, d):
     raise UnsafeTradeError(f"{sym}: позиция всё ещё открыта после аварийного закрытия")
 
 
-def open_trade(ex, sig):
+def open_trade(ex, sig, before_submit=None):
     """Открыть сделку только в DEMO, подтвердить защиту на бирже."""
     sym, d = sig["symbol"], sig["d"]
     side = "buy" if d == 1 else "sell"
@@ -200,6 +200,11 @@ def open_trade(ex, sig):
     params = {"stopLoss": {"triggerPrice": sl}, "takeProfit": {"triggerPrice": tp},
               "slTriggerBy": "MarkPrice", "tpTriggerBy": "LastPrice"}
     sent_ms = int(time.time() * 1000)
+    # Записываем неопределённый ордер только перед фактической отправкой.
+    # Сетевые сбои на fetch_ticker/set_leverage в preflight безопасно повторять:
+    # они ещё не могли открыть торговую позицию.
+    if before_submit is not None:
+        before_submit(sent_ms)
     try:
         order = ex.create_order(sym, "market", side, qty, None, params)
     except Exception as exc:
@@ -557,12 +562,15 @@ def run_cycle(ex, st, symbols):
             REASONS[sym] = "сигнал найден"
             sb.tg(sb.signal_text(sig))
             st["last"][sym] = sig["bar_ts"]  # не повторять один сигнал каждые 5 минут
-            # Записываем намерение ДО внешнего запроса. Сбой не создаст второй ордер.
-            st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
-                             "started_ms": int(time.time() * 1000)}
-            save_state(st)
+            # Persistent intent сохраняется только НЕПОСРЕДСТВЕННО перед create_order:
+            # preflight-запросы не должны провоцировать ложную аварийную остановку.
+            def mark_submit(started_ms):
+                st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
+                                 "started_ms": started_ms}
+                save_state(st)
+
             try:
-                trade, msg = open_trade(ex, sig)
+                trade, msg = open_trade(ex, sig, before_submit=mark_submit)
             except UnsafeTradeError as exc:
                 st["halted"], st["paused"] = True, True
                 save_state(st)  # pending остаётся до ручной сверки
