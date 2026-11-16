@@ -203,6 +203,39 @@ class TradingSafetyTests(unittest.TestCase):
         ex.set_leverage.assert_called_once_with(3, "BTC/USDT:USDT")
         ex.set_margin_mode.assert_not_called()
 
+    def test_preflight_timeout_does_not_mark_order_as_pending(self):
+        ex = Mock()
+        ex.fetch_ticker.side_effect = ccxt.RequestTimeout("ticker timeout")
+        sent = []
+        sig = {
+            "symbol": "BTC/USDT:USDT", "d": 1, "price": 100,
+            "stop": 98, "target": 104, "dist": 2, "qty": 0.1,
+            "lev": 1, "side": "LONG"
+        }
+        with self.assertRaises(ccxt.NetworkError):
+            trader.open_trade(ex, sig, before_submit=sent.append)
+        self.assertEqual(sent, [])
+        ex.create_order.assert_not_called()
+
+    def test_intent_persisted_just_before_order(self):
+        ex = Mock()
+        ex.fetch_ticker.return_value = {"last": 100}
+        ex.amount_to_precision.return_value = "0.1"
+        ex.price_to_precision.side_effect = lambda sym, px: str(px)
+        ex.create_order.side_effect = ccxt.RequestTimeout("order timeout")
+        sent = []
+        sig = {
+            "symbol": "BTC/USDT:USDT", "d": 1, "price": 100,
+            "stop": 98, "target": 104, "dist": 2, "qty": 0.1,
+            "lev": 1, "side": "LONG"
+        }
+        sb.CAPITAL = 150
+        with patch.object(trader, "ensure_margin_and_leverage"):
+            with self.assertRaises(trader.UnsafeTradeError):
+                trader.open_trade(ex, sig, before_submit=sent.append)
+        self.assertEqual(len(sent), 1)
+        ex.create_order.assert_called_once()
+
     def test_account_cross_margin_blocks_entry(self):
         ex = Mock()
         ex.private_get_v5_account_info.return_value = {
