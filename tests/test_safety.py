@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import ccxt
+
 import bybit_futures_signal_bot as sb
 import bybit_futures_trader as trader
 from tg_ui import TgUI
@@ -201,6 +203,39 @@ class TradingSafetyTests(unittest.TestCase):
         ex.set_leverage.assert_called_once_with(3, "BTC/USDT:USDT")
         ex.set_margin_mode.assert_not_called()
 
+    def test_preflight_timeout_does_not_mark_order_as_pending(self):
+        ex = Mock()
+        ex.fetch_ticker.side_effect = ccxt.RequestTimeout("ticker timeout")
+        sent = []
+        sig = {
+            "symbol": "BTC/USDT:USDT", "d": 1, "price": 100,
+            "stop": 98, "target": 104, "dist": 2, "qty": 0.1,
+            "lev": 1, "side": "LONG"
+        }
+        with self.assertRaises(ccxt.NetworkError):
+            trader.open_trade(ex, sig, before_submit=sent.append)
+        self.assertEqual(sent, [])
+        ex.create_order.assert_not_called()
+
+    def test_intent_persisted_just_before_order(self):
+        ex = Mock()
+        ex.fetch_ticker.return_value = {"last": 100}
+        ex.amount_to_precision.return_value = "0.1"
+        ex.price_to_precision.side_effect = lambda sym, px: str(px)
+        ex.create_order.side_effect = ccxt.RequestTimeout("order timeout")
+        sent = []
+        sig = {
+            "symbol": "BTC/USDT:USDT", "d": 1, "price": 100,
+            "stop": 98, "target": 104, "dist": 2, "qty": 0.1,
+            "lev": 1, "side": "LONG"
+        }
+        sb.CAPITAL = 150
+        with patch.object(trader, "ensure_margin_and_leverage"):
+            with self.assertRaises(trader.UnsafeTradeError):
+                trader.open_trade(ex, sig, before_submit=sent.append)
+        self.assertEqual(len(sent), 1)
+        ex.create_order.assert_called_once()
+
     def test_account_cross_margin_blocks_entry(self):
         ex = Mock()
         ex.private_get_v5_account_info.return_value = {
@@ -264,6 +299,127 @@ class TradingSafetyTests(unittest.TestCase):
                 self.assertEqual(st["closed"], [])
                 trader.save_state(st)
                 self.assertEqual(trader.load_state()["schema_version"], 2)
+
+
+
+class ApiRecoveryTests(unittest.TestCase):
+    def state(self):
+        return {
+            "schema_version": 2, "last": {}, "closed": [
+                {"symbol": "XMR/USDT:USDT", "pnl": -1.421, "ts": 1794836400}
+            ],
+            "open": {
+                "ZEC/USDT:USDT": {
+                    "d": -1, "qty": 0.03, "stop": 934.0,
+                    "target": 800.63, "opened_ms": 1794765840000
+                }
+            }, "pending": None,
+            "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "day_start": 38271.0, "peak": 38271.0,
+            "paused": True, "halted": True, "notified_day": "halted",
+        }
+
+    def exchange(self, stop="934", target="800.63"):
+        ex = Mock()
+        ex.private_get_v5_account_info.return_value = {
+            "retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}
+        }
+        ex.fetch_positions.return_value = [{
+            "symbol": "ZEC/USDT:USDT", "contracts": 0.03,
+            "side": "short", "info": {
+                "positionIdx": 0, "stopLoss": stop, "takeProfit": target
+            }
+        }]
+        return ex
+
+    def recovery(self, state, exchange, balance=38269.579):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(trader, "STOP_FILE", Path(td) / "STOP"),
+            patch.object(trader, "equity", return_value=balance),
+            patch.object(trader, "save_state"),
+        ):
+            return trader.verify_and_resume(exchange, state)
+
+    def test_manual_recovery_verifies_position_protection_and_keeps_history(self):
+        st = self.state()
+        ok, reason = self.recovery(st, self.exchange())
+        self.assertTrue(ok, reason)
+        self.assertFalse(st["halted"])
+        self.assertFalse(st["paused"])
+        self.assertEqual(st["closed"][0]["pnl"], -1.421)
+
+    def test_recovery_rejects_missing_sl(self):
+        st = self.state()
+        ok, msg = self.recovery(st, self.exchange(stop=""))
+        self.assertFalse(ok)
+        self.assertIn("нет подтверждённых", msg)
+        self.assertTrue(st["halted"])
+
+    def test_recovery_rejects_unknown_positions(self):
+        st = self.state()
+        ex = self.exchange()
+        ex.fetch_positions.return_value.append({
+            "symbol": "ETH/USDT:USDT", "contracts": 0.1, "side": "long",
+            "info": {"positionIdx": 0, "stopLoss": "1", "takeProfit": "2"}
+        })
+        ok, msg = self.recovery(st, ex)
+        self.assertFalse(ok)
+        self.assertIn("биржевые позиции", msg)
+        self.assertTrue(st["paused"])
+
+    def test_recovery_rejects_unknown_pending_order(self):
+        st = self.state()
+        st["pending"] = {"symbol": "BTC/USDT:USDT"}
+        ex = self.exchange()
+        ok, msg = self.recovery(st, ex)
+        self.assertFalse(ok)
+        self.assertIn("неразрешённый ордер", msg)
+        ex.private_get_v5_account_info.assert_not_called()
+
+    def test_recovery_checks_daily_loss_limit(self):
+        st = self.state()
+        ok, msg = self.recovery(st, self.exchange(), balance=38265.0)
+        self.assertFalse(ok)
+        self.assertIn("дневной лимит", msg)
+        self.assertTrue(st["halted"])
+
+    def test_recovery_checks_maximum_drawdown(self):
+        st = self.state()
+        ok, msg = self.recovery(st, self.exchange(), balance=38255.0)
+        self.assertFalse(ok)
+        self.assertIn("просадка", msg)
+        self.assertTrue(st["halted"])
+
+    def test_recovery_rejects_unavailable_api(self):
+        st = self.state()
+        ex = self.exchange()
+        with tempfile.TemporaryDirectory() as td, patch.object(trader, "STOP_FILE", Path(td) / "STOP"):
+            with patch.object(trader, "equity", side_effect=ccxt.NetworkError("timeout")):
+                ok, msg = trader.verify_and_resume(ex, st)
+        self.assertFalse(ok)
+        self.assertIn("недоступны", msg)
+        self.assertTrue(st["halted"])
+
+    def test_api_network_exception_is_distinct_from_auth_failure(self):
+        self.assertIsInstance(ccxt.RequestTimeout("timeout"), ccxt.NetworkError)
+        self.assertNotIsInstance(ccxt.AuthenticationError("invalid keys"), ccxt.NetworkError)
+
+    def test_telegram_recovery_button_only_admin(self):
+        calls = []
+        ctx = SimpleNamespace(
+            st={"halted": True, "paused": True}, lock=__import__("threading").RLock(),
+            verify_resume=lambda: (calls.append("recovered") or (True, "Проверено")),
+            info={}, reasons={}, meta={}, save=Mock(),
+        )
+        ui = TgUI(ctx, "fake", "-100123", "42")
+        ui.send = Mock()
+        ui.handle({"message": {"chat": {"id": -100123}, "from": {"id": 99},
+                               "text": "🔄 Проверить и возобновить"}})
+        self.assertEqual(calls, [])
+        ui.handle({"message": {"chat": {"id": -100123}, "from": {"id": 42},
+                               "text": "🔄 Проверить и возобновить"}})
+        self.assertEqual(calls, ["recovered"])
 
 
 class TelegramAuthorizationTests(unittest.TestCase):

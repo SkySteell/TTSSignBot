@@ -51,6 +51,8 @@ class TgUI:
         paused = self.c.st.get("paused")
         rows = [["📊 Статистика", "📌 Позиции"], ["💰 Баланс", "ℹ️ Статус"],
                 ["🔎 Пары", "▶ Продолжить" if paused else "⏸ Пауза"], ["🛑 Закрыть всё"]]
+        if self.c.st.get("halted") and hasattr(self.c, "verify_resume"):
+            rows.append(["🔄 Проверить и возобновить"])
         return {"keyboard": [[{"text": t} for t in r] for r in rows],
                 "resize_keyboard": True, "is_persistent": True}
 
@@ -123,6 +125,13 @@ class TgUI:
                     self.c.save()
             self.send("⛔ Аварийная остановка: сначала требуется сверка с Bybit."
                       if blocked else "▶ Бот снова ищет входы.")
+        elif t == "🔄 Проверить и возобновить":
+            with self.c.lock:
+                if not hasattr(self.c, "verify_resume"):
+                    result = "Проверка восстановления недоступна в этой версии."
+                else:
+                    _ok, result = self.c.verify_resume()
+            self.send(result)
         elif t == "🛑 Закрыть всё":
             self.close_token = secrets.token_urlsafe(8)
             self.close_requested_at = time.time()
@@ -243,9 +252,12 @@ class TgUI:
             flags.append("⛔ аварийная остановка")
         if st.get("pending"):
             flags.append("🚨 неразрешённый ордер")
+        if self.c.meta.get("api_outage"):
+            flags.append("⚠️ временный сбой связи с Bybit")
         state = ", ".join(flags) if flags else "✅ работает"
         return (f"ℹ️ Статус: {state}\n"
                 f"Режим: {i['mode']}\n"
+                f"Причина аварийной остановки: {st.get('halt_reason') or 'нет'}\n"
                 f"Капитал в расчёте: до {i['capital_cap']:g} USDT, риск {i['risk']:.0%} на сделку, "
                 f"плечо ≤{i['lev']}x\n"
                 f"Макс. позиций: {i['max_pos']}, проверка каждые {i['scan'] // 60} мин\n"

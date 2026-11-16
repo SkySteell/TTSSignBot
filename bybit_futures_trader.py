@@ -24,6 +24,9 @@ Live (только после демо-периода):
 Это не финансовая рекомендация: вы можете потерять весь депозит.
 """
 import json
+import logging
+
+import ccxt
 import os
 import sys
 import threading
@@ -171,7 +174,7 @@ def emergency_flatten(ex, sym, d):
     raise UnsafeTradeError(f"{sym}: позиция всё ещё открыта после аварийного закрытия")
 
 
-def open_trade(ex, sig):
+def open_trade(ex, sig, before_submit=None):
     """Открыть сделку только в DEMO, подтвердить защиту на бирже."""
     sym, d = sig["symbol"], sig["d"]
     side = "buy" if d == 1 else "sell"
@@ -197,6 +200,11 @@ def open_trade(ex, sig):
     params = {"stopLoss": {"triggerPrice": sl}, "takeProfit": {"triggerPrice": tp},
               "slTriggerBy": "MarkPrice", "tpTriggerBy": "LastPrice"}
     sent_ms = int(time.time() * 1000)
+    # Записываем неопределённый ордер только перед фактической отправкой.
+    # Сетевые сбои на fetch_ticker/set_leverage в preflight безопасно повторять:
+    # они ещё не могли открыть торговую позицию.
+    if before_submit is not None:
+        before_submit(sent_ms)
     try:
         order = ex.create_order(sym, "market", side, qty, None, params)
     except Exception as exc:
@@ -242,7 +250,8 @@ def load_state():
     base = {
         "schema_version": 2, "last": {}, "open": {}, "closed": [],
         "legacy_closed": [], "pending": None, "day": "", "day_start": 0.0,
-        "peak": 0.0, "halted": False, "notified_day": "", "paused": False,
+        "peak": 0.0, "halted": False, "halt_reason": "",
+        "notified_day": "", "paused": False,
     }
     if not STATE_FILE.exists():
         return base
@@ -394,6 +403,83 @@ def manage_open(ex, st, positions):
                 raise
 
 
+# ---------------- РУЧНОЕ ВОССТАНОВЛЕНИЕ ----------------
+def verify_and_resume(ex, st):
+    """Снятие аварийной остановки ТОЛЬКО по явной команде администратора.
+
+    Требует доступного Bybit DEMO, сверки ВСЕХ позиций и биржевых SL/TP,
+    отсутствия неопределённых ордеров и соблюдения ограничений потерь.
+    Не делает рыночных ордеров и не корректирует чужие позиции.
+    """
+    if not st.get("halted"):
+        return False, "Аварийной остановки нет. Используйте обычную кнопку «Продолжить»."
+    if st.get("pending"):
+        return False, "Нельзя восстановить: неразрешённый ордер. Требуется ручная сверка Bybit."
+    if STOP_FILE.exists():
+        return False, "Нельзя восстановить: найден файл STOP."
+    try:
+        balance = equity(ex)
+        account = ex.private_get_v5_account_info()
+        if str(account.get("retCode", 0)) != "0":
+            raise RuntimeError(f"ошибка account info: {account.get('retMsg')}")
+        mode = str((account.get("result") or {}).get("marginMode") or "")
+        if mode != "ISOLATED_MARGIN":
+            return False, f"Нельзя восстановить: аккаунт в режиме {mode or 'неизвестен'}, нужен ISOLATED_MARGIN."
+
+        positions = open_positions(ex)
+        # Двойное чтение позиций, чтобы обнаружить изменение или несогласованное состояние.
+        positions_again = open_positions(ex)
+        if set(positions) != set(positions_again):
+            return False, "Нельзя восстановить: состояние позиций меняется; повторите проверку."
+        tracked = set(st["open"])
+        actual = set(positions_again)
+        if actual != tracked:
+            return False, (f"Нельзя восстановить: биржевые позиции {sorted(actual)}, "
+                           f"учёт бота {sorted(tracked)}. Дождитесь сверки закрытий.")
+
+        if len(positions_again) > MAX_OPEN_POSITIONS:
+            return False, "Нельзя восстановить: превышен лимит числа позиций."
+        for sym, p in positions_again.items():
+            t = st["open"][sym]
+            expected_side = "long" if int(t["d"]) == 1 else "short"
+            if str(p.get("side") or "").lower() != expected_side:
+                return False, f"{sym}: сторона позиции не совпадает с состоянием бота."
+            qty = float(p.get("contracts") or 0)
+            expected_qty = float(t.get("qty") or 0)
+            if qty <= 0 or expected_qty <= 0 or abs(qty - expected_qty) > max(expected_qty * 0.001, 1e-8):
+                return False, f"{sym}: объём позиции отличается от записанного; проверка вручную."
+            info = p.get("info") or {}
+            stop = float(info.get("stopLoss") or 0)
+            target = float(info.get("takeProfit") or 0)
+            if stop <= 0 or target <= 0:
+                return False, f"{sym}: на бирже нет подтверждённых Stop Loss и Take Profit."
+            if (int(t["d"]) == 1 and stop >= target) or (int(t["d"]) == -1 and stop <= target):
+                return False, f"{sym}: Stop Loss и Take Profit расположены некорректно."
+
+        # Проверка лимитов на копии: отказ не сбрасывает ни флаги, ни дневную базу.
+        probe = dict(st)
+        probe["halted"] = False
+        reason = risk_gate(probe, balance)
+        if reason:
+            return False, f"Нельзя восстановить: {reason}"
+        st.update({
+            "day": probe["day"],
+            "day_start": probe["day_start"],
+            "peak": probe["peak"],
+            "halted": False,
+            "paused": False,
+            "halt_reason": "",
+            "notified_day": "",
+        })
+        save_state(st)
+        META["last_cycle"] = time.time()
+        return True, (f"✅ Связь с Bybit DEMO проверена. Позиции и SL/TP: "
+                      f"{len(positions_again)}. Лимиты соблюдены. Новые входы разрешены.")
+    except Exception as exc:
+        return False, (f"Восстановление отклонено: Bybit или проверка недоступны "
+                       f"({type(exc).__name__}: {str(exc)[:180]}).")
+
+
 # ---------------- ОСНОВНОЙ ЦИКЛ ----------------
 def run_cycle(ex, st, symbols):
     eq = equity(ex)
@@ -476,12 +562,15 @@ def run_cycle(ex, st, symbols):
             REASONS[sym] = "сигнал найден"
             sb.tg(sb.signal_text(sig))
             st["last"][sym] = sig["bar_ts"]  # не повторять один сигнал каждые 5 минут
-            # Записываем намерение ДО внешнего запроса. Сбой не создаст второй ордер.
-            st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
-                             "started_ms": int(time.time() * 1000)}
-            save_state(st)
+            # Persistent intent сохраняется только НЕПОСРЕДСТВЕННО перед create_order:
+            # preflight-запросы не должны провоцировать ложную аварийную остановку.
+            def mark_submit(started_ms):
+                st["pending"] = {"symbol": sym, "bar_ts": sig["bar_ts"],
+                                 "started_ms": started_ms}
+                save_state(st)
+
             try:
-                trade, msg = open_trade(ex, sig)
+                trade, msg = open_trade(ex, sig, before_submit=mark_submit)
             except UnsafeTradeError as exc:
                 st["halted"], st["paused"] = True, True
                 save_state(st)  # pending остаётся до ручной сверки
@@ -531,7 +620,7 @@ def main():
     st = load_state()
     save_state(st)
     sb.tg(
-        f"Автобот DEMO v4 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
+        f"Автобот DEMO v4.2 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
         f"риск ≤{sb.RISK_PCT:.0%} включая оценку издержек, плечо ≤{sb.MAX_LEVERAGE}x, "
         f"активных пар {len(symbols)}: {', '.join(symbols)}. "
         f"Исторических (непроверенных) сделок: {len(st.get('legacy_closed', []))}"
@@ -546,6 +635,7 @@ def main():
             equity=lambda: equity(ex), positions=lambda: open_positions(ex),
             close_market=lambda s_, q, d: close_market(ex, s_, q, d),
             save=lambda: save_state(st),
+            verify_resume=lambda: verify_and_resume(ex, st),
             info={"mode": MODE.upper(), "symbols": symbols, "capital_cap": CAPITAL_CAP,
                   "risk": sb.RISK_PCT, "lev": sb.MAX_LEVERAGE, "max_pos": MAX_OPEN_POSITIONS,
                   "scan": sb.SCAN_EVERY_SEC, "daily": DAILY_LOSS_LIMIT, "dd": MAX_DRAWDOWN},
@@ -561,15 +651,41 @@ def main():
         try:
             with LOCK:
                 run_cycle(ex, st, symbols)
+            # Восстановление связи не должно снимать ранее установленный
+            # защитный halted/paused: это отдельное действие администратора.
+            if META.pop("api_outage", False):
+                sb.tg("✅ Bybit DEMO: связь с биржей восстановлена. "
+                      "Управление входами — по текущему статусу и лимитам.")
+            META["api_status"] = "OK"
+        except ccxt.NetworkError as exc:
+            # Только сетевые сбои ЧТЕНИЯ в цикле. Неопределённые ответы при
+            # create_order/close_market останавливаются отдельно в open_trade/manage_open.
+            logging.exception("Временный сбой соединения Bybit DEMO")
+            META["api_status"] = f"сбой ({type(exc).__name__})"
+            now = time.time()
+            first = not META.get("api_outage", False)
+            META["api_outage"] = True
+            if first or now - META.get("last_api_alert", 0) >= 3600:
+                sb.tg(
+                    f"⚠️ Временная ошибка Bybit DEMO ({type(exc).__name__}). "
+                    "Этот цикл пропущен, новые ордера не отправлялись. "
+                    "Позиционные SL/TP на стороне биржи не изменялись. "
+                    "Автоматически повторим чтение на следующем цикле."
+                )
+                META["last_api_alert"] = now
         except Exception as exc:
-            print("Цикл:", exc)
-            # Продолжительная ошибка данных/состояния = запрет новых входов.
+            logging.exception("Критическая ошибка торгового цикла")
             st["halted"], st["paused"] = True, True
+            st["halt_reason"] = f"{type(exc).__name__}: {str(exc)[:200]}"
             try:
                 save_state(st)
             except Exception as save_exc:
-                print("Не удалось сохранить аварийную остановку:", save_exc)
-            sb.tg(f"🚨 TTSSignBot: авария цикла, новые входы остановлены: {str(exc)[:500]}")
+                logging.exception("Не удалось записать аварийную остановку: %s", save_exc)
+            sb.tg(
+                f"🚨 TTSSignBot: аварийная остановка из-за ошибки "
+                f"{type(exc).__name__}: {str(exc)[:260]}. "
+                "Для возобновления используйте «🔄 Проверить и возобновить»."
+            )
         time.sleep(sb.SCAN_EVERY_SEC)
 
 
