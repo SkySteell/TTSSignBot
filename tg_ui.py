@@ -257,7 +257,7 @@ class TgUI:
         state = ", ".join(flags) if flags else "✅ работает"
         return (f"ℹ️ Статус: {state}\n"
                 f"Режим: {i['mode']}\n"
-                + (f"Причина остановки: {st.get('halt_reason')}\n" if st.get("halt_reason") else "")
+                f"Причина аварийной остановки: {st.get('halt_reason') or 'нет'}\n"
                 f"Капитал в расчёте: до {i['capital_cap']:g} USDT, риск {i['risk']:.0%} на сделку, "
                 f"плечо ≤{i['lev']}x\n"
                 f"Макс. позиций: {i['max_pos']}, проверка каждые {i['scan'] // 60} мин\n"
