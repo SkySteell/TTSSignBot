@@ -239,7 +239,7 @@ def open_trade(ex, sig, before_submit=None):
         raise UnsafeTradeError(f"{sym}: сторона позиции не совпала; проверьте Bybit вручную")
     return {
         "qty": float(pos.get("contracts") or qty), "entry": entry,
-        "stop": float(sl), "target": float(tp), "dist": sig["dist"],
+        "stop": float(sl), "initial_stop": float(sl), "target": float(tp), "dist": sig["dist"],
         "risk_usdt": est_risk, "d": d, "side": sig["side"],
         "order_id": str(order.get("id") or ""),
         "opened_ms": sent_ms,
@@ -362,6 +362,106 @@ def fetch_trade_closed_pnl(ex, sym, trade):
     return sum(float(r["closedPnl"]) for r in candidates), total_qty
 
 
+
+def move_stop_to_breakeven(ex, st, sym, pos):
+    """One-shot +1R stop with estimated round-trip costs; reconcile before retry."""
+    from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+    from math import isfinite
+
+    trade = st["open"][sym]
+    d = int(trade["d"])
+    entry = float(trade["entry"])
+    info = pos.get("info") or {}
+    qty = float(pos.get("contracts") or 0)
+    if (d not in (-1, 1) or entry <= 0
+            or str(pos.get("side") or "").lower() != ("long" if d == 1 else "short")
+            or abs(qty - float(trade["qty"])) > max(float(trade["qty"]) * 0.001, 1e-8)
+            or info.get("positionIdx") not in (None, "", 0, "0")):
+        raise UnsafeTradeError(f"{sym}: позиция изменилась перед переносом SL")
+    sl = float(info.get("stopLoss") or 0)
+    tp = float(info.get("takeProfit") or 0)
+    if not all(isfinite(v) and v > 0 for v in (entry, qty, sl, tp)):
+        raise UnsafeTradeError(f"{sym}: SL/TP отсутствуют перед переносом в безубыток")
+
+    intent = trade.get("breakeven_pending")
+    if intent:
+        desired, expected_tp = float(intent["stop"]), float(intent["target"])
+    else:
+        if trade.get("breakeven_done") or st.get("halted") or st.get("paused"):
+            return
+        initial = float(trade.get("initial_stop", trade["stop"]))
+        distance = d * (entry - initial)
+        if distance <= 0:
+            # Legacy/manual stop already at entry or better: never loosen it.
+            return
+        mark = float(pos.get("markPrice") or 0)
+        if not all(isfinite(v) for v in (mark, initial, distance)):
+            raise UnsafeTradeError(f"{sym}: некорректные цены для переноса SL")
+        if mark <= 0 or d * (mark - entry) < distance:
+            return
+        tick = float((ex.market(sym).get("precision") or {}).get("price") or 0)
+        if ex.precisionMode != ccxt.TICK_SIZE or tick <= 0:
+            raise UnsafeTradeError(f"{sym}: неизвестный шаг цены для переноса SL")
+        raw = Decimal(str(entry)) * (Decimal("1") + Decimal(str(d * sb.RT_COST)))
+        step = Decimal(str(tick))
+        rounded = (raw / step).to_integral_value(
+            rounding=ROUND_CEILING if d == 1 else ROUND_FLOOR) * step
+        desired = float(ex.price_to_precision(sym, float(rounded)))
+        expected_tp = tp
+        if d * (desired - entry) < 0:
+            raise UnsafeTradeError(f"{sym}: некорректное округление безубытка")
+        if d * (sl - desired) >= -tick / 2:
+            # The actual exchange stop is already at least this protective.
+            trade.update(initial_stop=initial, stop=sl, breakeven_done=True)
+            save_state(st)
+            return
+        if desired <= 0 or d * (mark - desired) <= 0 or d * (tp - desired) <= 0:
+            return
+        trade["initial_stop"] = initial
+        trade["breakeven_pending"] = {"stop": desired, "target": tp}
+        # No exchange mutation until the recovery intent is durable.
+        save_state(st)
+        try:
+            response = ex.private_post_v5_position_trading_stop({
+                "category": "linear", "symbol": ex.market_id(sym),
+                "tpslMode": "Full", "positionIdx": 0,
+                "stopLoss": ex.price_to_precision(sym, desired),
+                "slTriggerBy": "MarkPrice",
+            })
+            if str(response.get("retCode", -1)) != "0":
+                raise RuntimeError(f"Bybit: {response.get('retMsg')}")
+        except Exception as exc:
+            # A timeout can mean the stop WAS changed. Reconcile on the next
+            # cycle, never blindly send the mutation twice.
+            raise UnsafeTradeError(f"{sym}: перенос SL не подтверждён; требуется сверка") from exc
+
+    # Read-only reconciliation also runs after restart, including while halted.
+    try:
+        actual = open_positions(ex).get(sym)
+    except Exception as exc:
+        raise UnsafeTradeError(f"{sym}: чтение результата переноса SL не подтверждено") from exc
+    if actual is None:
+        return  # next cycle will reconcile closure via Closed PnL
+    actual_info = actual.get("info") or {}
+    actual_sl = float(actual_info.get("stopLoss") or 0)
+    actual_tp = float(actual_info.get("takeProfit") or 0)
+    tick = float((ex.market(sym).get("precision") or {}).get("price") or 0)
+    if (str(actual.get("side") or "").lower() != ("long" if d == 1 else "short")
+            or abs(float(actual.get("contracts") or 0) - qty) > max(qty * 0.001, 1e-8)
+            or actual_info.get("positionIdx") not in (None, "", 0, "0")
+            or not all(isfinite(v) and v > 0 for v in (actual_sl, actual_tp))
+            or d * (actual_sl - desired) < -tick / 2
+            or abs(actual_tp - expected_tp) > max(tick / 2, 1e-10)):
+        raise UnsafeTradeError(f"{sym}: новый SL или прежний TP не подтверждены; входы запрещены")
+    trade["stop"] = actual_sl
+    trade["breakeven_done"] = True
+    trade.pop("breakeven_pending", None)
+    save_state(st)
+    sb.tg(f"🛡 {sym}: SL перенесён в безубыток с запасом на расчётные издержки: "
+          f"{actual_sl:g}. TP {actual_tp:g} сохранён и подтверждён на бирже. "
+          "Фактический нулевой PnL не гарантирован (исполнение и фандинг).")
+
+
 def manage_open(ex, st, positions):
     """Проверяет таймаут и записывает только подтверждённый биржевой PnL."""
     for sym in list(st["open"]):
@@ -403,6 +503,9 @@ def manage_open(ex, st, positions):
                 sb.tg(f"🚨 {sym}: закрытие по таймауту не подтверждено: {exc}. Новые входы остановлены")
                 raise
 
+        else:
+            move_stop_to_breakeven(ex, st, sym, positions[sym])
+
 
 # ---------------- РУЧНОЕ ВОССТАНОВЛЕНИЕ ----------------
 def verify_and_resume(ex, st):
@@ -416,6 +519,8 @@ def verify_and_resume(ex, st):
         return False, "Аварийной остановки нет. Используйте обычную кнопку «Продолжить»."
     if st.get("pending"):
         return False, "Нельзя восстановить: неразрешённый ордер. Требуется ручная сверка Bybit."
+    if any(t.get("breakeven_pending") for t in st["open"].values()):
+        return False, "Нельзя восстановить: перенос SL ещё не сверен с Bybit."
     if STOP_FILE.exists():
         return False, "Нельзя восстановить: найден файл STOP."
     try:
@@ -634,7 +739,7 @@ def main():
     st = load_state()
     save_state(st)
     sb.tg(
-        f"Автобот DEMO v4.3 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
+        f"Автобот DEMO v4.4 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
         f"риск ≤{sb.RISK_PCT:.0%} включая оценку издержек, плечо ≤{sb.MAX_LEVERAGE}x, "
         f"активных пар {len(symbols)}: {', '.join(symbols)}. "
         f"Исторических (непроверенных) сделок: {len(st.get('legacy_closed', []))}"
@@ -732,3 +837,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
