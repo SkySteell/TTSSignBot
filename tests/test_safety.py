@@ -1,4 +1,5 @@
 import json
+import errno
 import tempfile
 import time
 import unittest
@@ -182,6 +183,20 @@ class TradingSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "только MODE=demo"):
                 trader.make_exchange()
 
+    def test_atomic_state_save_preserves_original_if_disk_exhausted(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "trader_state.json"
+            initial = {"halted": True, "closed": [{"pnl": -1.421}]}
+            path.write_text(json.dumps(initial), encoding="utf-8")
+            with (
+                patch.object(trader, "STATE_FILE", path),
+                patch("tempfile.NamedTemporaryFile",
+                      side_effect=OSError(errno.ENOSPC, "No space left on device")),
+            ):
+                with self.assertRaises(OSError):
+                    trader.save_state({"halted": False, "closed": []})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), initial)
+
     def test_existing_stop_file_blocks_new_entries(self):
         st = self.base()
         with tempfile.TemporaryDirectory() as td:
@@ -348,6 +363,41 @@ class ApiRecoveryTests(unittest.TestCase):
         self.assertFalse(st["halted"])
         self.assertFalse(st["paused"])
         self.assertEqual(st["closed"][0]["pnl"], -1.421)
+
+    def test_recovery_rejects_full_disk_without_mutating_live_state(self):
+        st = self.state()
+        before = json.loads(json.dumps(st))
+        ex = self.exchange()
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(trader, "STOP_FILE", Path(td) / "STOP"),
+            patch.object(trader, "equity", return_value=38269.579),
+            patch.object(trader, "save_state",
+                         side_effect=OSError(errno.ENOSPC, "No space left on device")),
+        ):
+            ok, msg = trader.verify_and_resume(ex, st)
+        self.assertFalse(ok)
+        self.assertIn("нет свободного места", msg)
+        self.assertEqual(st, before)
+        self.assertTrue(st["halted"])
+        self.assertTrue(st["paused"])
+
+    def test_recovery_only_unblocks_after_successful_persist(self):
+        st = self.state()
+        ex = self.exchange()
+        recorded = []
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(trader, "STOP_FILE", Path(td) / "STOP"),
+            patch.object(trader, "equity", return_value=38269.579),
+            patch.object(trader, "save_state", side_effect=lambda v: recorded.append(dict(v))),
+        ):
+            ok, msg = trader.verify_and_resume(ex, st)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(recorded), 1)
+        self.assertFalse(recorded[0]["halted"])
+        self.assertFalse(st["halted"])
+        self.assertEqual(st, recorded[0])
 
     def test_recovery_rejects_missing_sl(self):
         st = self.state()
