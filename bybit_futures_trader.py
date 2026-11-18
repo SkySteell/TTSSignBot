@@ -634,7 +634,7 @@ def main():
     st = load_state()
     save_state(st)
     sb.tg(
-        f"Автобот DEMO v4.2 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
+        f"Автобот DEMO v4.3 запущен. Капитал ≤{CAPITAL_CAP} USDT, "
         f"риск ≤{sb.RISK_PCT:.0%} включая оценку издержек, плечо ≤{sb.MAX_LEVERAGE}x, "
         f"активных пар {len(symbols)}: {', '.join(symbols)}. "
         f"Исторических (непроверенных) сделок: {len(st.get('legacy_closed', []))}"
