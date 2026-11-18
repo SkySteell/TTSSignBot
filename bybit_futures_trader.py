@@ -24,6 +24,7 @@ Live (только после демо-периода):
 Это не финансовая рекомендация: вы можете потерять весь депозит.
 """
 import json
+import errno
 import logging
 
 import ccxt
@@ -462,7 +463,10 @@ def verify_and_resume(ex, st):
         reason = risk_gate(probe, balance)
         if reason:
             return False, f"Нельзя восстановить: {reason}"
-        st.update({
+        # Нельзя разблокировать бот только в оперативной памяти, если диск
+        # переполнен. СНАЧАЛА атомарно сохраняем безопасное новое состояние.
+        resumed_state = dict(st)
+        resumed_state.update({
             "day": probe["day"],
             "day_start": probe["day_start"],
             "peak": probe["peak"],
@@ -471,12 +475,22 @@ def verify_and_resume(ex, st):
             "halt_reason": "",
             "notified_day": "",
         })
-        save_state(st)
+        save_state(resumed_state)
+        # Только после подтверждённой успешной записи снимаем флаги в памяти.
+        st.clear()
+        st.update(resumed_state)
         META["last_cycle"] = time.time()
         return True, (f"✅ Связь с Bybit DEMO проверена. Позиции и SL/TP: "
                       f"{len(positions_again)}. Лимиты соблюдены. Новые входы разрешены.")
+    except OSError as exc:
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            return False, (
+                "⛔ Восстановление запрещено: нет свободного места для записи состояния. "
+                "Освободите место на BotHost, проверьте сделки на Bybit и повторите проверку."
+            )
+        return False, f"Восстановление отклонено: ошибка хранилища ({exc})."
     except Exception as exc:
-        return False, (f"Восстановление отклонено: Bybit или проверка недоступны "
+        return False, (f"Восстановление отклонено: биржа или проверка недоступны "
                        f"({type(exc).__name__}: {str(exc)[:180]}).")
 
 
@@ -673,6 +687,32 @@ def main():
                     "Автоматически повторим чтение на следующем цикле."
                 )
                 META["last_api_alert"] = now
+        except OSError as exc:
+            logging.exception("Ошибка файлового хранилища торгового бота")
+            st["halted"], st["paused"] = True, True
+            st["halt_reason"] = f"Ошибка хранилища: {type(exc).__name__}: {str(exc)[:160]}"
+            META["storage_error"] = st["halt_reason"]
+            try:
+                save_state(st)
+            except OSError as save_exc:
+                logging.error("Не удалось записать защитную остановку на диск: %s", save_exc)
+            now = time.time()
+            if now - META.get("last_storage_alert", 0) >= 3600:
+                if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                    sb.tg(
+                        "🚨 BotHost: место на диске исчерпано. "
+                        "НОВЫЕ СДЕЛКИ ОСТАНОВЛЕНЫ. "
+                        "Запись истории и защитной остановки на диск не гарантирована. "
+                        "Проверьте открытые позиции и SL/TP в Bybit DEMO, "
+                        "освободите место и только затем используйте "
+                        "«🔄 Проверить и возобновить»."
+                    )
+                else:
+                    sb.tg(
+                        f"🚨 Ошибка дискового хранилища: {str(exc)[:240]}. "
+                        "Новые сделки остановлены; проверьте сохранность состояния."
+                    )
+                META["last_storage_alert"] = now
         except Exception as exc:
             logging.exception("Критическая ошибка торгового цикла")
             st["halted"], st["paused"] = True, True
@@ -684,7 +724,8 @@ def main():
             sb.tg(
                 f"🚨 TTSSignBot: аварийная остановка из-за ошибки "
                 f"{type(exc).__name__}: {str(exc)[:260]}. "
-                "Для возобновления используйте «🔄 Проверить и возобновить»."
+                "Для возобновления используйте «🔄 Проверить и возобновить» "
+                "после устранения причины ошибки."
             )
         time.sleep(sb.SCAN_EVERY_SEC)
 
